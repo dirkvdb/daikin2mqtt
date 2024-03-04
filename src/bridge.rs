@@ -16,8 +16,6 @@ pub struct DaikinMqttBridgeConfig {
 
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
-    mqtt_base_topic: String,
-    hass_discovery: bool,
     cloud_client_code: String,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
@@ -25,11 +23,8 @@ pub struct DaikinMqttBridge {
 
 impl DaikinMqttBridge {
     pub fn new(cfg: DaikinMqttBridgeConfig) -> DaikinMqttBridge {
-        let mqtt_base_topic = format!("{}/", cfg.mqtt_config.base_topic);
         DaikinMqttBridge {
             mqtt: MqttConnection::new(cfg.mqtt_config),
-            mqtt_base_topic,
-            hass_discovery: cfg.hass_discovery,
             cloud_client_code: cfg.cloud_client_code,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
