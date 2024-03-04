@@ -1,0 +1,21 @@
+[package]
+edition = "2021"
+name = "daikin2mqtt"
+version = "0.1.1"
+default-run = "daikin2mqtt"
+
+[dependencies]
+bytes = "1.5.0"
+env_logger = "0.11.2"
+tokio = { version = "1.35.1", features = ["macros", "net", "io-util", "rt"] }
+log = "0.4.20"
+clap = { version = "4.4.18", features = ["derive", "env"] }
+rumqttc = "0.24.0"
+strum = { version = "0.26.1", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11.23", features = ["json"] }
+test-log = "0.2.15"
+
+[dev-dependencies]
+env_logger = "*"

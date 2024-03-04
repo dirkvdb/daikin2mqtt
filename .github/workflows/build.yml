@@ -1,0 +1,18 @@
+name: Build
+
+on: [push]
+
+jobs:
+  compile:
+    name: ${{ matrix.cfg.os }}
+    runs-on: ${{ matrix.cfg.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+          - { os: ubuntu-latest }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --all-features
