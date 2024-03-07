@@ -26,6 +26,12 @@ pub struct MqttData {
     pub payload: String,
 }
 
+impl MqttData {
+    pub fn new(topic: String, payload: String) -> MqttData {
+        MqttData { topic, payload }
+    }
+}
+
 pub struct MqttConnection {
     client: AsyncClient,
     eventloop: EventLoop,
@@ -90,13 +96,20 @@ impl MqttConnection {
 
     async fn subscribe_to_commands(&mut self) -> Result<(), MqttBridgeError> {
         let cmd_subscription_topic = format!("{}/+/cmnd/+", self.base_topic);
-        self.client.subscribe(cmd_subscription_topic, QoS::ExactlyOnce).await?;
+        self.client
+            .subscribe(cmd_subscription_topic, QoS::ExactlyOnce)
+            .await?;
         Ok(())
     }
 
     pub async fn publish_online(&mut self) -> Result<(), MqttBridgeError> {
         self.client
-            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, ONLINE_PAYLOAD)
+            .publish(
+                state_topic(&self.base_topic),
+                QoS::AtLeastOnce,
+                true,
+                ONLINE_PAYLOAD,
+            )
             .await?;
 
         Ok(())
@@ -104,13 +117,21 @@ impl MqttConnection {
 
     pub async fn publish_offline(&mut self) -> Result<(), MqttBridgeError> {
         self.client
-            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, OFFLINE_PAYLOAD)
+            .publish(
+                state_topic(&self.base_topic),
+                QoS::AtLeastOnce,
+                true,
+                OFFLINE_PAYLOAD,
+            )
             .await?;
 
         Ok(())
     }
 
-    async fn handle_mqtt_message(&mut self, ev: Event) -> Result<Option<MqttData>, MqttBridgeError> {
+    async fn handle_mqtt_message(
+        &mut self,
+        ev: Event,
+    ) -> Result<Option<MqttData>, MqttBridgeError> {
         match ev {
             Event::Incoming(event) => match event {
                 Packet::ConnAck(data) => {
