@@ -3,10 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use openid::Token;
 use reqwest::{StatusCode, Url};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::MqttBridgeError;
 
@@ -33,8 +30,6 @@ impl OnectaProvider {
     }
 }
 
-const ISSUER: &str = "https://idp.onecta.daikineurope.com";
-const AUTH_API: &str = "https://idp.onecta.daikineurope.com/v1/";
 const API: &str = "https://api.onecta.daikineurope.com/v1/";
 const REDIRECT: &str = "onectaintegration://callback/";
 
@@ -73,7 +68,7 @@ impl DaikinCloudConnection {
         }
     }
 
-    pub async fn update(&mut self) -> Result<(), MqttBridgeError> {
+    pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
         log::info!("Updating cloud connection");
 
         if self.token.is_none() {
@@ -91,18 +86,17 @@ impl DaikinCloudConnection {
             return Err(MqttBridgeError::NotAuhrorized);
         }
 
-        self.update_status().await?;
+        Ok(self.update_status().await?)
         // match res {
-        //     Ok(_) => log::info!("Status updated"),
+        //     Ok(str) => log::info!("Status updated"),
         //     Err(MqttBridgeError::NotAuhrorized) => {
-        //         log::info!("Refresh access token");
-        //         self.refresh_access_token().await?;
+        //         self.obtain_access_token().await?;
         //         self.update_status().await?;
         //     }
         //     Err(err) => return Err(err),
         // }
 
-        Ok(())
+        
     }
 
     async fn obtain_access_token(&mut self) -> Result<(), MqttBridgeError> {
@@ -111,7 +105,7 @@ impl DaikinCloudConnection {
         Ok(())
     }
 
-    async fn update_status(&mut self) -> Result<(), MqttBridgeError> {
+    async fn update_status(&mut self) -> Result<String, MqttBridgeError> {
         // Perform a request to the cloud API to update the status of the devices
         let url = format!("{}gateway-devices", API);
 
@@ -136,10 +130,7 @@ impl DaikinCloudConnection {
                 .text()
                 .await
                 .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to read response: {}", err)))?;
-            DaikinCloudConnection::process_status_json(
-                serde_json::from_str(&body).map_err(|_| MqttBridgeError::ParseError)?,
-            )?;
-            Ok(())
+            Ok(body)
         } else {
             Err(MqttBridgeError::NetworkError(format!(
                 "Failed to obtain gateway devices: {} {}",
@@ -147,24 +138,6 @@ impl DaikinCloudConnection {
                 res.text().await.unwrap(),
             )))
         }
-    }
-
-    fn process_status_json(json: Value) -> Result<(), MqttBridgeError> {
-        let nodes = json.as_array().ok_or(MqttBridgeError::ParseError)?;
-        for node in nodes {
-            // Process the status JSON and publish the MQTT messages
-            let mangement_points = node["managementPoints"].as_array().ok_or(MqttBridgeError::ParseError)?;
-            for mp in mangement_points {
-                // ...
-                if let Some(id) = mp["embeddedId"].as_str() {
-                    log::info!("Management point: {}", id);
-                } else {
-                    log::info!("No id present");
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn authentication_data_path(base_dir: &Path) -> PathBuf {
@@ -204,20 +177,3 @@ impl DaikinCloudConnection {
     }
 }
 
-// Test for parsing response json
-#[cfg(test)]
-mod tests {
-    fn test_data_dir() -> std::path::PathBuf {
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("resources/test");
-        d
-    }
-
-    #[test_log::test]
-    fn process_status_json() {
-        let json = std::fs::read_to_string(test_data_dir().join("managementpoints.json")).unwrap();
-        DaikinCloudConnection::process_status_json(serde_json::from_str(&json).unwrap()).unwrap();
-    }
-
-    use super::*;
-}
