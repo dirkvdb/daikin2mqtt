@@ -17,8 +17,8 @@ const PACKAGE: &str = env!("CARGO_PKG_NAME");
 struct Opt {
     #[clap(long = "daikin-poll-interval", env = "DAIKIN_POLL_INTERVAL", default_value_t = 600)]
     cloud_poll_interval: u64,
-
-    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::from("st2.s.AtLtzsZV8A.l46Ey_2xvkBHk6-0gJAYGU26n3Q-oMxpOMALZ-q-8-VXaW2dNwXVeTJhDn6nh2Y-6AhheAO6rCrmuKqukyi8c74CBr6sX7Yq0nBLrtjx6dvdJI-4ovUvy3SEAh0MEsfw.pPtwQXoLyYnJ9ukaG8mD3jKeaa6a0xhvV7iNVFspN734G0B7tCu_L6F3MpqtW0fXfX0WAZZWCsG7-7i7WOWnVw.sc3"))]
+    
+    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::from("st2.s.AtLtAFJTaw.U4AX6UZ7bYOqDnL6LS4YL38GuurZ6iUPUpA4BAt59FzNgJMGmrfJqDTIs_ySZ7aS8Pt_fN138OlFPtcIv1XK0jKsuPM3EOuaxefieBE2mztAJdhWDnVc4D9SClKO8ybN.MFSGWlgvB4RM30tddsIK2GSNTWkRKFwNWgnQquWDYsFS8mIsalo-bvn_CnYpkroICmEyRegvt8u3RHSYOiU4hg.sc3"))]
     cloud_client_code: String,
 
     // set the mqtt addr
