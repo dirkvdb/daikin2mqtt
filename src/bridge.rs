@@ -1,5 +1,3 @@
-use std::os::macos::raw::stat;
-
 use crate::daikincloudconnection::DaikinCloudConnection;
 use crate::mqtt::{MqttConfig, MqttConnection, MqttData};
 use crate::MqttBridgeError;
@@ -43,7 +41,7 @@ struct DaikinStatus {
 
 pub struct DaikinMqttBridgeConfig {
     pub mqtt_config: MqttConfig,
-    pub hass_discovery: bool,
+    //pub hass_discovery: bool,
     pub cloud_client_code: String,
     pub poll_interval: time::Duration,
     pub data_dir: std::path::PathBuf,
@@ -51,6 +49,8 @@ pub struct DaikinMqttBridgeConfig {
 
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
+    mqtt_base_topic: String,
+    //hass_discovery: bool,
     cloud_client_code: String,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
@@ -60,6 +60,8 @@ impl DaikinMqttBridge {
     pub fn new(cfg: DaikinMqttBridgeConfig) -> DaikinMqttBridge {
         DaikinMqttBridge {
             mqtt: MqttConnection::new(cfg.mqtt_config),
+            mqtt_base_topic,
+            hass_discovery: cfg.hass_discovery,
             cloud_client_code: cfg.cloud_client_code,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,

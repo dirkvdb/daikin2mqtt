@@ -47,13 +47,12 @@ struct Opt {
     #[clap(long = "mqtt-base-topic", env = "DAIKIN_MQTT_BASE_TOPIC", default_value_t = String::from("daikin"))]
     mqtt_base_topic: String,
 
-    #[clap(
-        long = "hass-discovery",
-        env = "DAIKIN_HASS_DISCOVERY",
-        default_value_t = false
-    )]
-    hass_discovery: bool,
-
+    // #[clap(
+    //     long = "hass-discovery",
+    //     env = "DAIKIN_HASS_DISCOVERY",
+    //     default_value_t = false
+    // )]
+    // hass_discovery: bool,
     #[clap(long = "data-dir", env = "DAIKIN_DATA_DIR", default_value_t = String::from("./data"))]
     data_dir: String,
 }
@@ -77,7 +76,7 @@ async fn main() {
             password: opt.mqtt_password.unwrap_or(String::new()),
             base_topic: opt.mqtt_base_topic,
         },
-        hass_discovery: opt.hass_discovery,
+        //hass_discovery: opt.hass_discovery,
         cloud_client_code: opt.cloud_client_code,
         data_dir: PathBuf::from(opt.data_dir),
         poll_interval: time::Duration::from_secs(opt.cloud_poll_interval),
