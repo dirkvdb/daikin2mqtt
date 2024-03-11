@@ -2,6 +2,7 @@ FROM amd64/rust:1-alpine3.19 as builder
 WORKDIR /project
 COPY . .
 
+ENV RUSTFLAGS="-Ctarget-feature=-crt-static"
 RUN apk add libc-dev pkgconfig openssl-dev
 RUN cargo install --path .
 
