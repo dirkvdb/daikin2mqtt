@@ -49,7 +49,6 @@ pub struct DaikinMqttBridgeConfig {
 
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
-    mqtt_base_topic: String,
     //hass_discovery: bool,
     cloud_client_code: String,
     poll_interval: time::Duration,
@@ -60,8 +59,7 @@ impl DaikinMqttBridge {
     pub fn new(cfg: DaikinMqttBridgeConfig) -> DaikinMqttBridge {
         DaikinMqttBridge {
             mqtt: MqttConnection::new(cfg.mqtt_config),
-            mqtt_base_topic,
-            hass_discovery: cfg.hass_discovery,
+            //hass_discovery: cfg.hass_discovery,
             cloud_client_code: cfg.cloud_client_code,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
@@ -115,14 +113,14 @@ impl DaikinMqttBridge {
         let domestic_hot_water_tank_json = to_string(&status.domestic_hot_water_tank)?;
         self.mqtt
             .publish(MqttData::new(
-                format!("{}climate_control", self.mqtt_base_topic),
+                format!("{}climate_control", self.mqtt.base_topic()),
                 climate_control_json,
             ))
             .await?;
 
         self.mqtt
             .publish(MqttData::new(
-                format!("{}domestic_hot_water", self.mqtt_base_topic),
+                format!("{}domestic_hot_water", self.mqtt.base_topic()),
                 domestic_hot_water_tank_json,
             ))
             .await

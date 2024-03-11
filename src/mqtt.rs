@@ -87,6 +87,10 @@ impl MqttConnection {
         Ok(None)
     }
 
+    pub fn base_topic(&self) -> &String {
+        &self.base_topic
+    }
+
     pub async fn publish(&mut self, data: MqttData) -> Result<(), MqttBridgeError> {
         Ok(self
             .client
