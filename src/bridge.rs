@@ -162,7 +162,7 @@ impl DaikinMqttBridge {
         self.mqtt
             .publish(
                 MqttData::new(
-                    format!("{}climate_control", self.mqtt.base_topic()),
+                    format!("{}/climate_control", self.mqtt.base_topic()),
                     climate_control_json,
                 ),
                 true,
@@ -172,7 +172,7 @@ impl DaikinMqttBridge {
         self.mqtt
             .publish(
                 MqttData::new(
-                    format!("{}domestic_hot_water", self.mqtt.base_topic()),
+                    format!("{}/domestic_hot_water", self.mqtt.base_topic()),
                     domestic_hot_water_tank_json,
                 ),
                 true,
@@ -207,7 +207,6 @@ impl DaikinMqttBridge {
     }
 
     fn process_status_json(json_string: String) -> Result<DaikinStatus, MqttBridgeError> {
-        log::info!("Processing status JSON: {}", json_string);
         let mut status = DaikinStatus::default();
 
         let json: Value = serde_json::from_str(&json_string)?;
@@ -218,7 +217,7 @@ impl DaikinMqttBridge {
             for mp in mangement_points {
                 // ...
                 if let Some(id) = mp["embeddedId"].as_str() {
-                    log::info!("Management point: {}", id);
+                    log::debug!("Management point: {}", id);
                     match id {
                         "climateControlMainZone" => {
                             log::info!("climateControlMainZone");
