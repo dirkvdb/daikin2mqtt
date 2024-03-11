@@ -13,20 +13,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PACKAGE: &str = env!("CARGO_PKG_NAME");
 
 #[derive(Parser, Debug)]
-#[clap(
-    name = "daikin2mqtt",
-    about = "Interface between daikin heatpump and MQTT"
-)]
+#[clap(name = "daikin2mqtt", about = "Interface between daikin heatpump and MQTT")]
 struct Opt {
-    #[clap(
-        long = "daikin-poll-interval",
-        env = "DAIKIN_POLL_INTERVAL",
-        default_value_t = 600
-    )]
+    #[clap(long = "daikin-poll-interval", env = "DAIKIN_POLL_INTERVAL", default_value_t = 600)]
     cloud_poll_interval: u64,
-
-    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::from("st2.s.AtLtHQDzTA.GSsk5GIf5dWdM0TR8PK8ROYIW17i7HnDU4EQLeZuh5pY4vr-MCDrT-FInuqvoojLOg3Fnzn84WC3rDRSpkU2GM-e4vLpQ-xnyjPo9SQvbbGxJNvRfppPmfrcqwn5SaZv.CUk39fqQ7pdjBWhB_9BLwV0MBzN9eiwTZqzAbKGZ5EOTK97TpKlJWHwUYFjAvyVW-gK7iOdFJA7njmvfzyVReA.sc3"))]
-    cloud_client_code: String,
 
     // set the mqtt addr
     #[clap(long = "mqtt-addr", env = "DAIKIN_MQTT_ADDRESS")]
@@ -77,7 +67,6 @@ async fn main() {
             base_topic: opt.mqtt_base_topic,
         },
         //hass_discovery: opt.hass_discovery,
-        cloud_client_code: opt.cloud_client_code,
         data_dir: PathBuf::from(opt.data_dir),
         poll_interval: time::Duration::from_secs(opt.cloud_poll_interval),
     };

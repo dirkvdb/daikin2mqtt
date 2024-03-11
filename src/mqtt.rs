@@ -87,29 +87,26 @@ impl MqttConnection {
         Ok(None)
     }
 
-    pub async fn publish(&mut self, data: MqttData) -> Result<(), MqttBridgeError> {
+    pub fn base_topic(&self) -> &String {
+        &self.base_topic
+    }
+
+    pub async fn publish(&mut self, data: MqttData, retain: bool) -> Result<(), MqttBridgeError> {
         Ok(self
             .client
-            .publish(data.topic, QoS::AtLeastOnce, true, data.payload)
+            .publish(data.topic, QoS::AtLeastOnce, retain, data.payload)
             .await?)
     }
 
     async fn subscribe_to_commands(&mut self) -> Result<(), MqttBridgeError> {
-        let cmd_subscription_topic = format!("{}/+/cmnd/+", self.base_topic);
-        self.client
-            .subscribe(cmd_subscription_topic, QoS::ExactlyOnce)
-            .await?;
+        let cmd_subscription_topic = format!("{}/cmnd/+", self.base_topic);
+        self.client.subscribe(cmd_subscription_topic, QoS::ExactlyOnce).await?;
         Ok(())
     }
 
     pub async fn publish_online(&mut self) -> Result<(), MqttBridgeError> {
         self.client
-            .publish(
-                state_topic(&self.base_topic),
-                QoS::AtLeastOnce,
-                true,
-                ONLINE_PAYLOAD,
-            )
+            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, ONLINE_PAYLOAD)
             .await?;
 
         Ok(())
@@ -117,21 +114,13 @@ impl MqttConnection {
 
     pub async fn publish_offline(&mut self) -> Result<(), MqttBridgeError> {
         self.client
-            .publish(
-                state_topic(&self.base_topic),
-                QoS::AtLeastOnce,
-                true,
-                OFFLINE_PAYLOAD,
-            )
+            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, OFFLINE_PAYLOAD)
             .await?;
 
         Ok(())
     }
 
-    async fn handle_mqtt_message(
-        &mut self,
-        ev: Event,
-    ) -> Result<Option<MqttData>, MqttBridgeError> {
+    async fn handle_mqtt_message(&mut self, ev: Event) -> Result<Option<MqttData>, MqttBridgeError> {
         match ev {
             Event::Incoming(event) => match event {
                 Packet::ConnAck(data) => {
