@@ -47,12 +47,18 @@ pub struct DaikinMqttBridgeConfig {
     pub data_dir: std::path::PathBuf,
 }
 
+#[derive(Default)]
+struct MqttStatus {
+    online: bool,
+}
+
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
     //hass_discovery: bool,
     cloud_client_code: String,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
+    status: MqttStatus,
 }
 
 impl DaikinMqttBridge {
@@ -63,6 +69,7 @@ impl DaikinMqttBridge {
             cloud_client_code: cfg.cloud_client_code,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
+            status: MqttStatus::default(),
         }
     }
 
@@ -73,57 +80,134 @@ impl DaikinMqttBridge {
         let client_secret =
             "TNL1ePwnOkf6o2gKiI8InS8nVwTz2G__VYkv6WznzJGUnwLHLTmKYp-7RZc6FA3yS6D0Wgj_snvqsU5H_LPHQA".to_string();
 
-        let mut connection = DaikinCloudConnection::new(
-            client_id,
-            client_secret,
-            self.cloud_client_code.clone(),
-            &self.data_dir,
-        );
+        let mut connection =
+            DaikinCloudConnection::new(client_id, client_secret, self.cloud_client_code.clone(), &self.data_dir);
 
         loop {
             tokio::select! {
                 mqtt_msg = self.mqtt.poll() => {
                     if let Ok(Some(msg)) = mqtt_msg {
                         log::debug!("MQTT cmnd: {} {}", msg.topic, msg.payload);
-                        // if let Err(err) = self.handle_node_command(&msg).await {
-                        //     log::error!("Failed to process command: {}: {} ({err})", msg.topic, msg.payload);
-                        // }
+                        if let Err(err) = self.handle_mqtt_message(msg, &mut connection).await {
+                            log::error!("Failed to process mqtt command: ({err})");
+                        } else if let Err(err) = self.poll_cloud(&mut connection).await {
+                            log::error!("Failed to poll cloud: ({err})");
+                        }
                     }
                 }
                 _ = interval.tick() => {
                     log::info!("Poll cloud");
-                    match connection.update().await {
-                        Ok(status_json) => {
-                            match DaikinMqttBridge::process_status_json(status_json) {
-                                Ok(status) => {self.publish_status(&status).await?;}
-                                Err(err) => {log::error!("Failed to process status: {}", err);}
-                            }
-                        }
-                        Err(err) => {
-                            log::error!("Failed to update cloud status: {err}");
-                        }
+                    if let Err(err) = self.poll_cloud(&mut connection).await {
+                        log::error!("Failed to poll cloud: ({err})");
                     }
                 }
             }
         }
     }
 
-    async fn publish_status(&mut self, status: &DaikinStatus) -> Result<(), MqttBridgeError> {
+    async fn poll_cloud(&mut self, connection: &mut DaikinCloudConnection) -> Result<(), MqttBridgeError> {
+        match connection.update().await {
+            Ok(status_json) => {
+                self.update_online_status(true).await?;
+
+                self.status.online = true;
+                match DaikinMqttBridge::process_status_json(status_json) {
+                    Ok(status) => {
+                        self.update_heatpump_status(status).await?;
+                    }
+                    Err(err) => {
+                        log::error!("Failed to process status: {}", err);
+                    }
+                }
+            }
+            Err(MqttBridgeError::AuthorizationRequired(url)) => {
+                self.update_online_status(false).await?;
+                self.mqtt
+                    .publish(
+                        MqttData::new(
+                            format!("{}/authorization_required", self.mqtt.base_topic()),
+                            url.to_string(),
+                        ),
+                        true,
+                    )
+                    .await?;
+                log::info!(
+                    "Authorization required: {}",
+                    format!("{}/authorization_required", self.mqtt.base_topic())
+                );
+                log::info!("Authorization required: {}", url);
+            }
+            Err(err) => {
+                self.update_online_status(false).await?;
+                log::error!("Failed to update cloud status: {err}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn update_online_status(&mut self, online: bool) -> Result<(), MqttBridgeError> {
+        if online != self.status.online {
+            if online {
+                self.mqtt.publish_online().await?;
+            } else {
+                self.mqtt.publish_offline().await?;
+            }
+
+            self.status.online = online;
+        }
+
+        Ok(())
+    }
+
+    async fn update_heatpump_status(&mut self, status: DaikinStatus) -> Result<(), MqttBridgeError> {
         let climate_control_json = to_string(&status.climate_control)?;
         let domestic_hot_water_tank_json = to_string(&status.domestic_hot_water_tank)?;
         self.mqtt
-            .publish(MqttData::new(
-                format!("{}climate_control", self.mqtt.base_topic()),
-                climate_control_json,
-            ))
+            .publish(
+                MqttData::new(
+                    format!("{}climate_control", self.mqtt.base_topic()),
+                    climate_control_json,
+                ),
+                true,
+            )
             .await?;
 
         self.mqtt
-            .publish(MqttData::new(
-                format!("{}domestic_hot_water", self.mqtt.base_topic()),
-                domestic_hot_water_tank_json,
-            ))
+            .publish(
+                MqttData::new(
+                    format!("{}domestic_hot_water", self.mqtt.base_topic()),
+                    domestic_hot_water_tank_json,
+                ),
+                true,
+            )
             .await
+    }
+
+    async fn handle_mqtt_message(
+        &mut self,
+        mqtt_msg: MqttData,
+        connection: &mut DaikinCloudConnection,
+    ) -> Result<(), MqttBridgeError> {
+        if let Some(cmd) = mqtt_msg
+            .topic
+            .strip_prefix(format!("{}/cmnd/", self.mqtt.base_topic()).as_str())
+        {
+            if cmd == "authorization_code" {
+                log::debug!("Authorization code: {}", mqtt_msg.payload);
+                connection.set_authorization_code(mqtt_msg.payload);
+                let auth_required_topic = format!("{}/authorization_required", self.mqtt.base_topic());
+                self.mqtt
+                    .publish(MqttData::new(auth_required_topic, "".to_string()), false)
+                    .await?;
+            } else {
+                log::info!("Unknown command: {}", mqtt_msg.topic);
+            }
+        } else {
+            log::info!("Ignored command: {}", mqtt_msg.topic);
+        }
+
+        Ok(())
     }
 
     fn process_status_json(json_string: String) -> Result<DaikinStatus, MqttBridgeError> {
@@ -134,9 +218,7 @@ impl DaikinMqttBridge {
         let nodes = json.as_array().ok_or(MqttBridgeError::ParseError)?;
         for node in nodes {
             // Process the status JSON and publish the MQTT messages
-            let mangement_points = node["managementPoints"]
-                .as_array()
-                .ok_or(MqttBridgeError::ParseError)?;
+            let mangement_points = node["managementPoints"].as_array().ok_or(MqttBridgeError::ParseError)?;
             for mp in mangement_points {
                 // ...
                 if let Some(id) = mp["embeddedId"].as_str() {
@@ -146,30 +228,23 @@ impl DaikinMqttBridge {
                             log::info!("climateControlMainZone");
                             status.climate_control.holiday_mode_active =
                                 parse_bool(&mp["isHolidayModeActive"]["value"])?;
-                            status.climate_control.is_in_warning_state =
-                                parse_bool(&mp["isInWarningState"]["value"])?;
-                            status.climate_control.is_in_error_state =
-                                parse_bool(&mp["isInErrorState"]["value"])?;
-                            status.climate_control.operation_mode =
-                                parse_str(&mp["operationMode"]["value"])?;
-                            status.climate_control.on_off_mode =
-                                parse_str(&mp["onOffMode"]["value"])?;
-                            status.climate_control.leaving_water_temperature = parse_i8(
-                                &mp["sensoryData"]["value"]["leavingWaterTemperature"]["value"],
-                            )?;
-                            status.climate_control.outdoor_temperature = parse_i8(
-                                &mp["sensoryData"]["value"]["outdoorTemperature"]["value"],
-                            )?;
+                            status.climate_control.is_in_warning_state = parse_bool(&mp["isInWarningState"]["value"])?;
+                            status.climate_control.is_in_error_state = parse_bool(&mp["isInErrorState"]["value"])?;
+                            status.climate_control.operation_mode = parse_str(&mp["operationMode"]["value"])?;
+                            status.climate_control.on_off_mode = parse_str(&mp["onOffMode"]["value"])?;
+                            status.climate_control.leaving_water_temperature =
+                                parse_i8(&mp["sensoryData"]["value"]["leavingWaterTemperature"]["value"])?;
+                            status.climate_control.outdoor_temperature =
+                                parse_i8(&mp["sensoryData"]["value"]["outdoorTemperature"]["value"])?;
                             status.climate_control.room_temperature =
                                 parse_f32(&mp["sensoryData"]["value"]["roomTemperature"]["value"])?;
-                            status.climate_control.heating_setpoint_leaving_water_offset =
-                                parse_i8(
-                                    &mp["temperatureControl"]["value"]["operationModes"]["heating"]
-                                        ["setpoints"]["leavingWaterOffset"]["value"],
-                                )?;
+                            status.climate_control.heating_setpoint_leaving_water_offset = parse_i8(
+                                &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
+                                    ["leavingWaterOffset"]["value"],
+                            )?;
                             status.climate_control.heating_setpoint_room_temperature = parse_i8(
-                                &mp["temperatureControl"]["value"]["operationModes"]["heating"]
-                                    ["setpoints"]["roomTemperature"]["value"],
+                                &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
+                                    ["roomTemperature"]["value"],
                             )?;
                         }
                         "domesticHotWaterTank" => {
@@ -178,15 +253,13 @@ impl DaikinMqttBridge {
                                 parse_bool(&mp["isInWarningState"]["value"])?;
                             status.domestic_hot_water_tank.is_in_error_state =
                                 parse_bool(&mp["isInErrorState"]["value"])?;
-                            status.domestic_hot_water_tank.on_off_mode =
-                                parse_str(&mp["onOffMode"]["value"])?;
-                            status.domestic_hot_water_tank.operation_mode =
-                                parse_str(&mp["operationMode"]["value"])?;
+                            status.domestic_hot_water_tank.on_off_mode = parse_str(&mp["onOffMode"]["value"])?;
+                            status.domestic_hot_water_tank.operation_mode = parse_str(&mp["operationMode"]["value"])?;
                             status.domestic_hot_water_tank.water_temperature =
                                 parse_i8(&mp["sensoryData"]["value"]["tankTemperature"]["value"])?;
                             status.domestic_hot_water_tank.water_setpoint = parse_i8(
-                                &mp["temperatureControl"]["value"]["operationModes"]["heating"]
-                                    ["setpoints"]["domesticHotWaterTemperature"]["value"],
+                                &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
+                                    ["domesticHotWaterTemperature"]["value"],
                             )?;
                             status.domestic_hot_water_tank.powerfull_mode =
                                 parse_bool(&mp["isPowerfulModeActive"]["value"])?;
@@ -206,24 +279,15 @@ impl DaikinMqttBridge {
 }
 
 fn parse_i8(value: &Value) -> Result<i8, MqttBridgeError> {
-    value
-        .as_i64()
-        .ok_or(MqttBridgeError::ParseError)
-        .map(|v| v as i8)
+    value.as_i64().ok_or(MqttBridgeError::ParseError).map(|v| v as i8)
 }
 
 fn parse_f32(value: &Value) -> Result<f32, MqttBridgeError> {
-    value
-        .as_f64()
-        .ok_or(MqttBridgeError::ParseError)
-        .map(|v| v as f32)
+    value.as_f64().ok_or(MqttBridgeError::ParseError).map(|v| v as f32)
 }
 
 fn parse_str(value: &Value) -> Result<String, MqttBridgeError> {
-    value
-        .as_str()
-        .ok_or(MqttBridgeError::ParseError)
-        .map(|v| v.to_string())
+    value.as_str().ok_or(MqttBridgeError::ParseError).map(|v| v.to_string())
 }
 
 fn parse_bool(value: &Value) -> Result<bool, MqttBridgeError> {
@@ -250,37 +314,18 @@ mod tests {
         assert_eq!(daikin_status.climate_control.leaving_water_temperature, 56);
         assert_eq!(daikin_status.climate_control.outdoor_temperature, 14);
         assert_eq!(daikin_status.climate_control.room_temperature, 21.0);
-        assert_eq!(
-            daikin_status
-                .climate_control
-                .heating_setpoint_leaving_water_offset,
-            5
-        );
-        assert_eq!(
-            daikin_status
-                .climate_control
-                .heating_setpoint_room_temperature,
-            19
-        );
+        assert_eq!(daikin_status.climate_control.heating_setpoint_leaving_water_offset, 5);
+        assert_eq!(daikin_status.climate_control.heating_setpoint_room_temperature, 19);
         assert_eq!(daikin_status.climate_control.is_in_error_state, false);
         assert_eq!(daikin_status.climate_control.is_in_warning_state, false);
 
         assert_eq!(daikin_status.domestic_hot_water_tank.on_off_mode, "on");
-        assert_eq!(
-            daikin_status.domestic_hot_water_tank.operation_mode,
-            "heating"
-        );
+        assert_eq!(daikin_status.domestic_hot_water_tank.operation_mode, "heating");
         assert_eq!(daikin_status.domestic_hot_water_tank.water_temperature, 54);
         assert_eq!(daikin_status.domestic_hot_water_tank.water_setpoint, 45);
         assert_eq!(daikin_status.domestic_hot_water_tank.powerfull_mode, false);
-        assert_eq!(
-            daikin_status.domestic_hot_water_tank.is_in_error_state,
-            false
-        );
-        assert_eq!(
-            daikin_status.domestic_hot_water_tank.is_in_warning_state,
-            false
-        );
+        assert_eq!(daikin_status.domestic_hot_water_tank.is_in_error_state, false);
+        assert_eq!(daikin_status.domestic_hot_water_tank.is_in_warning_state, false);
     }
 
     #[test_log::test]

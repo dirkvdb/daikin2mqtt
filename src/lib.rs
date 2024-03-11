@@ -6,10 +6,13 @@ pub mod mqtt;
 
 use std::{array::TryFromSliceError, fmt, net::AddrParseError, str::Utf8Error};
 
+use reqwest::Url;
+
 #[derive(Debug)]
 pub enum MqttBridgeError {
     NetworkError(String),
     RuntimeError(String),
+    AuthorizationRequired(Url),
     ParseError,
     NotAuhrorized,
 }
@@ -19,6 +22,9 @@ impl fmt::Display for MqttBridgeError {
         match self {
             MqttBridgeError::NetworkError(str) => write!(f, "Network Error {}", str),
             MqttBridgeError::RuntimeError(str) => write!(f, "Runtime Error {}", str),
+            MqttBridgeError::AuthorizationRequired(url) => {
+                write!(f, "Authorization Required: visit {url}")
+            }
             MqttBridgeError::ParseError => write!(f, "Parse Error"),
             MqttBridgeError::NotAuhrorized => write!(f, "Authentication Error"),
         }

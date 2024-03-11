@@ -13,19 +13,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PACKAGE: &str = env!("CARGO_PKG_NAME");
 
 #[derive(Parser, Debug)]
-#[clap(
-    name = "daikin2mqtt",
-    about = "Interface between daikin heatpump and MQTT"
-)]
+#[clap(name = "daikin2mqtt", about = "Interface between daikin heatpump and MQTT")]
 struct Opt {
-    #[clap(
-        long = "daikin-poll-interval",
-        env = "DAIKIN_POLL_INTERVAL",
-        default_value_t = 600
-    )]
+    #[clap(long = "daikin-poll-interval", env = "DAIKIN_POLL_INTERVAL", default_value_t = 600)]
     cloud_poll_interval: u64,
 
-    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::from("st2.s.AtLtHQDzTA.GSsk5GIf5dWdM0TR8PK8ROYIW17i7HnDU4EQLeZuh5pY4vr-MCDrT-FInuqvoojLOg3Fnzn84WC3rDRSpkU2GM-e4vLpQ-xnyjPo9SQvbbGxJNvRfppPmfrcqwn5SaZv.CUk39fqQ7pdjBWhB_9BLwV0MBzN9eiwTZqzAbKGZ5EOTK97TpKlJWHwUYFjAvyVW-gK7iOdFJA7njmvfzyVReA.sc3"))]
+    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::new())]
     cloud_client_code: String,
 
     // set the mqtt addr
