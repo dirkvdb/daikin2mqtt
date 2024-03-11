@@ -42,7 +42,6 @@ struct DaikinStatus {
 pub struct DaikinMqttBridgeConfig {
     pub mqtt_config: MqttConfig,
     //pub hass_discovery: bool,
-    pub cloud_client_code: String,
     pub poll_interval: time::Duration,
     pub data_dir: std::path::PathBuf,
 }
@@ -55,7 +54,6 @@ struct MqttStatus {
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
     //hass_discovery: bool,
-    cloud_client_code: String,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
     status: MqttStatus,
@@ -66,7 +64,6 @@ impl DaikinMqttBridge {
         DaikinMqttBridge {
             mqtt: MqttConnection::new(cfg.mqtt_config),
             //hass_discovery: cfg.hass_discovery,
-            cloud_client_code: cfg.cloud_client_code,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
             status: MqttStatus::default(),
@@ -80,8 +77,7 @@ impl DaikinMqttBridge {
         let client_secret =
             "TNL1ePwnOkf6o2gKiI8InS8nVwTz2G__VYkv6WznzJGUnwLHLTmKYp-7RZc6FA3yS6D0Wgj_snvqsU5H_LPHQA".to_string();
 
-        let mut connection =
-            DaikinCloudConnection::new(client_id, client_secret, self.cloud_client_code.clone(), &self.data_dir);
+        let mut connection = DaikinCloudConnection::new(client_id, client_secret, &self.data_dir);
 
         loop {
             tokio::select! {

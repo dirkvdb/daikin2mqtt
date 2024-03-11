@@ -18,9 +18,6 @@ struct Opt {
     #[clap(long = "daikin-poll-interval", env = "DAIKIN_POLL_INTERVAL", default_value_t = 600)]
     cloud_poll_interval: u64,
 
-    #[clap(long = "daikin-cloud-client-code", env = "DAIKIN_CLOUD_CLIENT_CODE", default_value_t = String::new())]
-    cloud_client_code: String,
-
     // set the mqtt addr
     #[clap(long = "mqtt-addr", env = "DAIKIN_MQTT_ADDRESS")]
     mqtt_addr: String,
@@ -70,7 +67,6 @@ async fn main() {
             base_topic: opt.mqtt_base_topic,
         },
         //hass_discovery: opt.hass_discovery,
-        cloud_client_code: opt.cloud_client_code,
         data_dir: PathBuf::from(opt.data_dir),
         poll_interval: time::Duration::from_secs(opt.cloud_poll_interval),
     };

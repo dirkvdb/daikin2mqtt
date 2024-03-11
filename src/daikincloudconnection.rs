@@ -80,22 +80,22 @@ impl OnectaProvider {
     }
 }
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AuthenticationData {
+    token: Option<openid::Bearer>,
+    auth_code: String,
+}
+
 pub struct DaikinCloudConnection {
     http_client: reqwest::Client,
     openid_client: openid::Client<OnectaProvider>,
-    cloud_client_code: String,
     data_dir: std::path::PathBuf,
-    token: Option<openid::Bearer>,
+    authentication_data: AuthenticationData,
 }
 
 impl DaikinCloudConnection {
-    pub fn new(
-        client_id: String,
-        client_secret: String,
-        client_code: String,
-        data_dir: &Path,
-    ) -> DaikinCloudConnection {
-        let token = DaikinCloudConnection::restore_authenticate_data(data_dir).unwrap_or_default();
+    pub fn new(client_id: String, client_secret: String, data_dir: &Path) -> DaikinCloudConnection {
+        let authentication_data = DaikinCloudConnection::restore_authentication_data(data_dir).unwrap_or_default();
 
         let openid_client: openid::Client<_> = openid::Client::new(
             OnectaProvider::new(),
@@ -109,9 +109,8 @@ impl DaikinCloudConnection {
         DaikinCloudConnection {
             http_client: reqwest::Client::new(),
             openid_client,
-            cloud_client_code: client_code,
             data_dir: data_dir.to_path_buf(),
-            token,
+            authentication_data,
         }
     }
 
@@ -134,18 +133,18 @@ impl DaikinCloudConnection {
     }
 
     pub fn set_authorization_code(&mut self, code: String) {
-        self.cloud_client_code = code;
-        self.clear_authenticate_data();
+        self.clear_authentication_data();
+        self.authentication_data.auth_code = code;
     }
 
     pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
         log::info!("Updating cloud connection");
 
-        if self.cloud_client_code.is_empty() {
+        if self.authentication_data.auth_code.is_empty() {
             return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()));
         }
 
-        if self.token.is_none() {
+        if self.authentication_data.token.is_none() {
             log::info!("Obtain access token");
             match self.obtain_access_token().await {
                 Ok(_) => log::debug!("Token obtained"),
@@ -154,13 +153,16 @@ impl DaikinCloudConnection {
                 }
                 Err(err) => return Err(err),
             }
-            self.store_authenticate_data()?;
+            self.store_authentication_data()?;
         } else {
-            log::debug!("Token present: {}", self.token.as_ref().unwrap().access_token);
+            log::debug!(
+                "Token present: {}",
+                self.authentication_data.token.as_ref().unwrap().access_token
+            );
         }
 
-        if let Some(token) = self.token.take() {
-            self.token = Some(self.openid_client.ensure_token(token).await.unwrap());
+        if let Some(token) = self.authentication_data.token.take() {
+            self.authentication_data.token = Some(self.openid_client.ensure_token(token).await.unwrap());
         } else {
             log::info!("No token present");
             return Err(MqttBridgeError::NotAuhrorized);
@@ -178,10 +180,14 @@ impl DaikinCloudConnection {
     }
 
     async fn obtain_access_token(&mut self) -> Result<(), MqttBridgeError> {
-        match self.openid_client.request_token(&self.cloud_client_code).await {
+        match self
+            .openid_client
+            .request_token(&self.authentication_data.auth_code)
+            .await
+        {
             Ok(token) => {
-                self.token = Some(token);
-                log::info!("Access token obtained: {:?}", self.token);
+                self.authentication_data.token = Some(token);
+                log::info!("Access token obtained: {:?}", self.authentication_data.token);
                 Ok(())
             }
             Err(err) => {
@@ -203,7 +209,10 @@ impl DaikinCloudConnection {
             .header("Accept", "application/json")
             .header(
                 "Authorization",
-                format!("Bearer {}", self.token.as_ref().unwrap().access_token),
+                format!(
+                    "Bearer {}",
+                    self.authentication_data.token.as_ref().unwrap().access_token
+                ),
             )
             .send()
             .await
@@ -230,41 +239,38 @@ impl DaikinCloudConnection {
         base_dir.join("openid_authentication.json")
     }
 
-    fn clear_authenticate_data(&mut self) {
-        self.token = None;
+    fn clear_authentication_data(&mut self) {
+        self.authentication_data = AuthenticationData::default();
         if let Err(err) = std::fs::remove_file(DaikinCloudConnection::authentication_data_path(&self.data_dir)) {
             log::warn!("Failed to remove file: {}", err);
         }
     }
 
-    fn store_authenticate_data(&mut self) -> Result<(), MqttBridgeError> {
+    fn store_authentication_data(&mut self) -> Result<(), MqttBridgeError> {
         let path = DaikinCloudConnection::authentication_data_path(&self.data_dir);
-        match &self.token {
-            Some(token) => {
-                let json_str = serde_json::to_string(&token)?;
-                fs::create_dir_all(path.parent().unwrap())
-                    .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to create directory: {}", err)))?;
-                std::fs::write(path, json_str)
-                    .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to write file: {}", err)))?;
-            }
-            None => {
-                self.clear_authenticate_data();
-            }
+        if !self.authentication_data.auth_code.is_empty() {
+            let json_str = serde_json::to_string(&self.authentication_data)?;
+            fs::create_dir_all(path.parent().unwrap())
+                .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to create directory: {}", err)))?;
+            std::fs::write(path, json_str)
+                .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to write file: {}", err)))?;
+        } else {
+            self.clear_authentication_data();
         }
 
         Ok(())
     }
 
-    fn restore_authenticate_data(data_dir: &Path) -> Result<Option<openid::Bearer>, MqttBridgeError> {
+    fn restore_authentication_data(data_dir: &Path) -> Result<AuthenticationData, MqttBridgeError> {
         let path = DaikinCloudConnection::authentication_data_path(&data_dir);
         if path.exists() {
             let json_str = std::fs::read_to_string(&path)
                 .map_err(|err| MqttBridgeError::RuntimeError(format!("Failed to read file: {}", err)))?;
-            let token: openid::Bearer = serde_json::from_str(&json_str)
+            let auth_data: AuthenticationData = serde_json::from_str(&json_str)
                 .map_err(|err| MqttBridgeError::RuntimeError(format!("Failed to parse file: {}", err)))?;
-            return Ok(Some(token));
+            return Ok(auth_data);
         }
 
-        Ok(None)
+        Ok(AuthenticationData::default())
     }
 }
