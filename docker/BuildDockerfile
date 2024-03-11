@@ -2,7 +2,7 @@ FROM amd64/rust:1-alpine3.19 as builder
 WORKDIR /project
 COPY . .
 
-RUN apk add libc-dev
+RUN apk add libc-dev pkgconfig openssl-dev
 RUN cargo install --path .
 
 FROM amd64/alpine:3.19 as runtime
