@@ -2,11 +2,15 @@ use crate::daikincloudconnection::DaikinCloudConnection;
 use crate::mqtt::{MqttConfig, MqttConnection, MqttData};
 use crate::MqttBridgeError;
 use log;
+use reqwest::Url;
 use serde::Serialize;
 use serde_json::{to_string, Value};
 use tokio::time;
 
 //const HASS_DISCOVERY_TOPIC: &str = "homeassistant";
+
+const CLIENT_ID: &str = "emU20GdJDiiUxI_HnFGz69dD";
+const CLIENT_SECRET: &str = "TNL1ePwnOkf6o2gKiI8InS8nVwTz2G__VYkv6WznzJGUnwLHLTmKYp-7RZc6FA3yS6D0Wgj_snvqsU5H_LPHQA";
 
 #[derive(Default, Serialize)]
 struct ClimateControl {
@@ -49,6 +53,7 @@ pub struct DaikinMqttBridgeConfig {
 #[derive(Default)]
 struct MqttStatus {
     online: bool,
+    requesting_authorization: bool,
 }
 
 pub struct DaikinMqttBridge {
@@ -72,12 +77,8 @@ impl DaikinMqttBridge {
 
     pub async fn run(mut self) -> Result<(), MqttBridgeError> {
         let mut interval = time::interval(self.poll_interval);
-
-        let client_id = "emU20GdJDiiUxI_HnFGz69dD".to_string();
-        let client_secret =
-            "TNL1ePwnOkf6o2gKiI8InS8nVwTz2G__VYkv6WznzJGUnwLHLTmKYp-7RZc6FA3yS6D0Wgj_snvqsU5H_LPHQA".to_string();
-
-        let mut connection = DaikinCloudConnection::new(client_id, client_secret, &self.data_dir);
+        let mut connection =
+            DaikinCloudConnection::new(CLIENT_ID.to_string(), CLIENT_SECRET.to_string(), &self.data_dir);
 
         loop {
             tokio::select! {
@@ -92,7 +93,7 @@ impl DaikinMqttBridge {
                     }
                 }
                 _ = interval.tick() => {
-                    log::info!("Poll cloud");
+                    log::debug!("Poll cloud");
                     if let Err(err) = self.poll_cloud(&mut connection).await {
                         log::error!("Failed to poll cloud: ({err})");
                     }
@@ -105,6 +106,7 @@ impl DaikinMqttBridge {
         match connection.update().await {
             Ok(status_json) => {
                 self.update_online_status(true).await?;
+                self.stop_authorization_request().await?;
 
                 self.status.online = true;
                 match DaikinMqttBridge::process_status_json(status_json) {
@@ -118,20 +120,7 @@ impl DaikinMqttBridge {
             }
             Err(MqttBridgeError::AuthorizationRequired(url)) => {
                 self.update_online_status(false).await?;
-                self.mqtt
-                    .publish(
-                        MqttData::new(
-                            format!("{}/authorization_required", self.mqtt.base_topic()),
-                            url.to_string(),
-                        ),
-                        true,
-                    )
-                    .await?;
-                log::info!(
-                    "Authorization required: {}",
-                    format!("{}/authorization_required", self.mqtt.base_topic())
-                );
-                log::info!("Authorization required: {}", url);
+                self.request_authorization(&url).await?;
             }
             Err(err) => {
                 self.update_online_status(false).await?;
@@ -192,17 +181,38 @@ impl DaikinMqttBridge {
             if cmd == "authorization_code" {
                 log::debug!("Authorization code: {}", mqtt_msg.payload);
                 connection.set_authorization_code(mqtt_msg.payload);
-                let auth_required_topic = format!("{}/authorization_required", self.mqtt.base_topic());
-                self.mqtt
-                    .publish(MqttData::new(auth_required_topic, "".to_string()), false)
-                    .await?;
+                self.stop_authorization_request().await?;
             } else {
-                log::info!("Unknown command: {}", mqtt_msg.topic);
+                log::warn!("Unknown command: {}", mqtt_msg.topic);
             }
         } else {
             log::info!("Ignored command: {}", mqtt_msg.topic);
         }
 
+        Ok(())
+    }
+
+    fn authorization_topic(&self) -> String {
+        format!("{}/authorization_required", self.mqtt.base_topic())
+    }
+
+    async fn stop_authorization_request(&mut self) -> Result<(), MqttBridgeError> {
+        if self.status.requesting_authorization {
+            return Ok(());
+        }
+
+        let mqtt_data = MqttData::new(self.authorization_topic(), "".to_string());
+        self.mqtt.publish(mqtt_data, false).await?;
+        self.status.requesting_authorization = false;
+
+        Ok(())
+    }
+
+    async fn request_authorization(&mut self, url: &Url) -> Result<(), MqttBridgeError> {
+        let mqtt_data = MqttData::new(self.authorization_topic(), url.to_string());
+        self.mqtt.publish(mqtt_data, true).await?;
+        self.status.requesting_authorization = true;
+        log::info!("Authorization required: {}", url);
         Ok(())
     }
 
