@@ -181,7 +181,6 @@ impl DaikinMqttBridge {
             if cmd == "authorization_code" {
                 log::debug!("Authorization code: {}", mqtt_msg.payload);
                 connection.set_authorization_code(mqtt_msg.payload);
-                self.stop_authorization_request().await?;
             } else {
                 log::warn!("Unknown command: {}", mqtt_msg.topic);
             }

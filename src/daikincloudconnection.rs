@@ -169,14 +169,6 @@ impl DaikinCloudConnection {
         }
 
         Ok(self.update_status().await?)
-        // match res {
-        //     Ok(str) => log::info!("Status updated"),
-        //     Err(MqttBridgeError::NotAuhrorized) => {
-        //         self.obtain_access_token().await?;
-        //         self.update_status().await?;
-        //     }
-        //     Err(err) => return Err(err),
-        // }
     }
 
     async fn obtain_access_token(&mut self) -> Result<(), MqttBridgeError> {
@@ -219,7 +211,7 @@ impl DaikinCloudConnection {
             .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to obtain access token: {}", err)))?;
 
         if res.status() == StatusCode::UNAUTHORIZED {
-            Err(MqttBridgeError::NotAuhrorized)
+            Err(MqttBridgeError::AuthorizationRequired(self.auth_url()))
         } else if res.status().is_success() {
             let body = res
                 .text()
