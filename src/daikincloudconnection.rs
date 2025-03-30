@@ -5,6 +5,7 @@ use std::{
 
 use openid::Configurable;
 use reqwest::{StatusCode, Url};
+use serde::{Deserialize as _, Serialize};
 
 use crate::MqttBridgeError;
 
@@ -45,7 +46,7 @@ impl OnectaProvider {
             id_token_signing_alg_values_supported: vec!["RS256".to_string()],
             token_endpoint_auth_methods_supported: Some(vec!["client_secret_basic".to_string()]),
             scopes_supported: Some(vec!["openid".to_string()]),
-            token_introspection_endpoint: None,
+            introspection_endpoint: None,
             userinfo_endpoint: None,
             end_session_endpoint: None,
             registration_endpoint: None,
@@ -80,9 +81,31 @@ impl OnectaProvider {
     }
 }
 
+fn token_serialize<S>(x: &Option<openid::TemporalBearerGuard>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match x {
+        Some(token) => token.as_ref().serialize(s),
+        None => s.serialize_none(),
+    }
+}
+
+fn token_deserialize<'de, D>(d: D) -> Result<Option<openid::TemporalBearerGuard>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bearer = Option::<openid::Bearer>::deserialize(d)?;
+    match bearer {
+        Some(b) => Ok(Some(openid::TemporalBearerGuard::from(b))),
+        None => Ok(None),
+    }
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct AuthenticationData {
-    token: Option<openid::Bearer>,
+    #[serde(serialize_with = "token_serialize", deserialize_with = "token_deserialize")]
+    token: Option<openid::TemporalBearerGuard>,
     auth_code: String,
 }
 
@@ -157,7 +180,7 @@ impl DaikinCloudConnection {
         } else {
             log::debug!(
                 "Token present: {}",
-                self.authentication_data.token.as_ref().unwrap().access_token
+                self.authentication_data.token.as_ref().unwrap().as_ref().access_token
             );
         }
 
@@ -178,7 +201,7 @@ impl DaikinCloudConnection {
             .await
         {
             Ok(token) => {
-                self.authentication_data.token = Some(token);
+                self.authentication_data.token = Some(token.into());
                 log::info!("Access token obtained: {:?}", self.authentication_data.token);
                 Ok(())
             }
@@ -203,7 +226,7 @@ impl DaikinCloudConnection {
                 "Authorization",
                 format!(
                     "Bearer {}",
-                    self.authentication_data.token.as_ref().unwrap().access_token
+                    self.authentication_data.token.as_ref().unwrap().as_ref().access_token
                 ),
             )
             .send()
