@@ -9,9 +9,6 @@ use tokio::time;
 
 //const HASS_DISCOVERY_TOPIC: &str = "homeassistant";
 
-const CLIENT_ID: &str = "emU20GdJDiiUxI_HnFGz69dD";
-const CLIENT_SECRET: &str = "TNL1ePwnOkf6o2gKiI8InS8nVwTz2G__VYkv6WznzJGUnwLHLTmKYp-7RZc6FA3yS6D0Wgj_snvqsU5H_LPHQA";
-
 #[derive(Default, Serialize)]
 struct ClimateControl {
     holiday_mode_active: bool,
@@ -45,6 +42,9 @@ struct DaikinStatus {
 
 pub struct DaikinMqttBridgeConfig {
     pub mqtt_config: MqttConfig,
+    pub cloud_client_id: String,
+    pub cloud_client_secret: String,
+    pub cloud_redirect_uri: String,
     //pub hass_discovery: bool,
     pub poll_interval: time::Duration,
     pub data_dir: std::path::PathBuf,
@@ -58,6 +58,9 @@ struct MqttStatus {
 
 pub struct DaikinMqttBridge {
     mqtt: MqttConnection,
+    cloud_client_id: String,
+    cloud_client_secret: String,
+    cloud_redirect_uri: String,
     //hass_discovery: bool,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
@@ -68,6 +71,9 @@ impl DaikinMqttBridge {
     pub fn new(cfg: DaikinMqttBridgeConfig) -> DaikinMqttBridge {
         DaikinMqttBridge {
             mqtt: MqttConnection::new(cfg.mqtt_config),
+            cloud_client_id: cfg.cloud_client_id,
+            cloud_client_secret: cfg.cloud_client_secret,
+            cloud_redirect_uri: cfg.cloud_redirect_uri,
             //hass_discovery: cfg.hass_discovery,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
@@ -77,14 +83,18 @@ impl DaikinMqttBridge {
 
     pub async fn run(mut self) -> Result<(), MqttBridgeError> {
         let mut interval = time::interval(self.poll_interval);
-        let mut connection =
-            DaikinCloudConnection::new(CLIENT_ID.to_string(), CLIENT_SECRET.to_string(), &self.data_dir);
+        let mut connection = DaikinCloudConnection::new(
+            self.cloud_client_id.clone(),
+            self.cloud_client_secret.clone(),
+            self.cloud_redirect_uri.clone(),
+            &self.data_dir,
+        )?;
 
         loop {
             tokio::select! {
                 mqtt_msg = self.mqtt.poll() => {
                     if let Ok(Some(msg)) = mqtt_msg {
-                        log::debug!("MQTT cmnd: {} {}", msg.topic, msg.payload);
+                        log::debug!("MQTT cmnd: {}", msg.topic);
                         if let Err(err) = self.handle_mqtt_message(msg, &mut connection).await {
                             log::error!("Failed to process mqtt command: ({err})");
                         } else if let Err(err) = self.poll_cloud(&mut connection).await {
@@ -179,8 +189,13 @@ impl DaikinMqttBridge {
             .strip_prefix(format!("{}/cmnd/", self.mqtt.base_topic()).as_str())
         {
             if cmd == "authorization_code" {
-                log::debug!("Authorization code: {}", mqtt_msg.payload);
-                connection.set_authorization_code(mqtt_msg.payload);
+                connection.set_authorization_code(mqtt_msg.payload)?;
+                self.stop_authorization_request().await?;
+            } else if cmd == "revoke_authorization" {
+                let result = connection.revoke_authorization().await;
+                self.update_online_status(false).await?;
+                self.stop_authorization_request().await?;
+                result?;
             } else {
                 log::warn!("Unknown command: {}", mqtt_msg.topic);
             }
@@ -196,12 +211,12 @@ impl DaikinMqttBridge {
     }
 
     async fn stop_authorization_request(&mut self) -> Result<(), MqttBridgeError> {
-        if self.status.requesting_authorization {
+        if !self.status.requesting_authorization {
             return Ok(());
         }
 
         let mqtt_data = MqttData::new(self.authorization_topic(), "".to_string());
-        self.mqtt.publish(mqtt_data, false).await?;
+        self.mqtt.publish(mqtt_data, true).await?;
         self.status.requesting_authorization = false;
 
         Ok(())

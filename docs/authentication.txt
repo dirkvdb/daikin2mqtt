@@ -1,0 +1,531 @@
+Authorization
+Warning: This text contains links that lead to external websites. Daikin Europe N.V. does not have any responsibility for its contents.
+
+Before controlling or monitoring your Daikin devices with the ONECTA Cloud API, your application needs to request authorization. The ONECTA Cloud API uses the OpenID Connect (OIDC) protocol to authorize third-party applications to make requests on behalf of our end users.
+
+If a user has authorized your third-party application to access their data, your application will receive a confidential access token which it can use to make requests. If the access token is expired, a confidential refresh token can be used to receive a new access token.
+
+Please limit the exposure of access tokens. If you require continuous Onecta Cloud API access from your application to protected resources, consider encrypting access tokens before storing them.
+
+Refresh tokens should only be used by mobile applications if they are stored securely in the OS’s secure application storage. Please discard refresh tokens immediately if you do not plan on using them.
+
+To authorize your application with the ONECTA Cloud API, you need to initiate the OIDC authorization code flow. This flow consists of several steps:
+
+    Redirect the user to the authorize URL
+    The user is prompted to authorize your application
+    The user is redirected to your application with a code parameter
+    Obtain an access token using the code parameter
+    Exchanging a refresh token for a new access token
+    Revocation
+
+You can find a complete overview of the OIDC authorization flow in the diagram below.
+
+authorization_flow
+Step 1: Redirect the user to the authorize URL
+
+To initiate the OIDC authorization flow, your application has to redirect the user to the authorize URL. This will prompt the user to log in with their Daikin ID.
+
+Request Example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+https://idp.onecta.daikineurope.com/v1/oidc/authorize?
+  response_type=code
+  &client_id=<YOUR_CLIENT_ID>
+  &redirect_uri=<YOUR_REDIRECT_URI>
+  &scope=openid%20onecta:basic.integration%20offline_access
+
+
+
+Copy
+
+The scope parameter identifies the scopes that are being requested by your application. It must always include openid to inform the authorization server we are using the OIDC flow. The onecta:basic.integration scope gives your application access to the data of the user. You can also include offline_access if needed, it's not mandatory but available for use.
+
+Optionally, as a good practice for security, you can include a state parameter in the query. The state parameter is a random value your application can generate and store. It will be passed back to your application as a parameter of the redirect_uri when the user completes the authorization flow. Before trusting the authorization response, your application should check that the returned state parameter matches the one sent in the request. The state parameter protects our end users against Cross-Site Request Forgery (CSRF) attacks.
+Step 2: The user is prompted to authorize your application
+
+After logging in, our user has to give their informed and specific consent. A consent window will show the scopes that your application requests from the ONECTA Cloud API. By giving their consent, our user agrees with your application accessing their data.
+
+consent_screen For example, this consent page is triggered because of the scopes onecta:basic.integration and offline_access.
+Step 3: The user is redirected to your application with a code parameter
+
+If a user authorized your application, an authorization code is sent back to your redirect URL:
+
+
+
+<YOUR_REDIRECT_URI>?state=<YOUR_STATE_VALUE>code=<GENERATED_AUTH_CODE>
+
+
+
+Copy
+
+If a user did not authorize the application, the authorization flow will be cancelled.
+Step 4: Obtain an access token using the code parameter
+
+Your application can now call the token endpoint with the received authorization code. This endpoint will return a confidential access token and a confidential refresh token. Please protect them well.
+
+Request example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+POST https://idp.onecta.daikineurope.com/v1/oidc/token?
+  grant_type=authorization_code
+  &client_id=<YOUR_CLIENT_ID>
+  &client_secret=<YOUR_CLIENT_SECRET>
+  &code=<GENERATED_AUTH_CODE>
+  &redirect_uri=<YOUR_REDIRECT_URI>
+
+
+
+Copy
+
+Response example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+  "access_token":"DGLW7liUK5NKz5tj08VBF.....ANr2kMabvzJ",
+  "expires_in":3600,
+  "refresh_token":"50RRPu054bx16b2aiV.....nUX5Gy7YGbKCdR",
+}
+
+
+
+Copy
+
+In case the authorization code has already been used, you'll receive an error.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+400 Bad Request
+{
+    "error": "invalid_grant",
+    "error_description": "The provided authorization code or refresh token is revoked."
+}
+
+
+
+Copy
+
+With this token, your application is authorized to send requests to the ONECTA Cloud API on behalf of the logged in user. The token must be included in the Authorization header. Make sure to include Bearer in the header value.
+
+
+
+Authorization: "Bearer DGLW7liUK5NKz5tj08V.....BFANr2kMabvzJ"
+
+
+
+Copy
+Step 5: Exchanging a refresh token for a new access token
+
+Any access token you receive from the authorization server is configured to have a lifetime of one hour. This means that your application needs to retrieve a new access token when the current access token is expired. The refresh token is valid for 1 year and rotates each time it is used.
+
+To obtain a new access token, you have to use the refresh token that you received in the previous token request.
+
+Request example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+POST https://idp.onecta.daikineurope.com/v1/oidc/token?
+  grant_type=refresh_token
+  &client_id=<YOUR_CLIENT_ID>
+  &client_secret=<YOUR_CLIENT_SECRET>
+  &refresh_token=<YOUR_REFRESH_TOKEN>
+
+
+
+Copy
+
+Response example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+  "access_token":"eLlju2C1Cdq60pg29b6ebJgIPSU6wOo5",
+  "expires_in":3600,
+  "refresh_token":"a707kZ1Hnme16xaZTxFeam0oFzAlY20u",
+}
+
+
+
+Copy
+
+In case the refresh token has already been revoked, you'll receive an error.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+400 Bad Request
+{
+	"error": "invalid_grant",
+	"error_description": "The provided authorization code or refresh token is revoked."
+}
+
+
+
+Copy
+Step 6: Revocation
+
+Users must have the ability to revoke the integration from within your application. To do this, your application needs to call the /revoke endpoint and revoke both the access token and refresh token.
+
+Request example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+POST https://idp.onecta.daikineurope.com/v1/oidc/revoke?
+  token=<YOUR_TOKEN>
+  &client_id=<YOUR_CLIENT_ID>
+  &client_secret=<YOUR_CLIENT_SECRET>
+  &token_type_hint=<TOKEN_HINT>
+
+
+
+Copy
+
+[TOKEN_HINT] can be refresh_token or access_token
+
+Response example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+  "callId": "8c4d6f57ab314835991dab253fdb576d",
+  "errorCode": 0,
+  "apiVersion": 2,
+  "statusCode": 200,
+  "statusReason": "OK",
+  "time": "2023-11-16T16:41:26.250Z"
+}
+
+
+
+Copy
+Common mistakes
+
+When you start the authorization flow with the input parameters in your request, the identity provider can throw an error and show a screen saying "Something went wrong".
+
+When you inspect the network activity, you can find the exact message of the error. Please check if the error message matches with one of the following. In most browsers you can inspect the network activity by utilizing the developer tools (e.g. via F12).
+
+    The redirect URI in the request: <your_redirect_url> did not match a registered redirect URI.
+        Code: invalid_request
+        Description: The redirect URI you provided in the authorize or token request is not the same as the redirect URI you filled in when creating your application via the developer portal. Make sure that they are exactly the same.
+    The client was not found.
+        Code: unauthorized_client
+        Description: The client ID you provided in the authorize or token request is not the same as the client ID you received via the developer portal. Make sure that you copy the exact value.
+    Missing required parameter: scope
+        Code: invalid_request
+        Description: You might have forgotten to include or mistyped the scope parameter in the authorize request. For applications created via the developer portal, the scope parameter must be set to openid%20onecta:basic.integration.
+
+wrong_redirect_url
+Technical Details
+Access token format
+
+By default, all 3rd party integrations created via the developer portal will use JWT access tokens and opaque refresh tokens. If your B2B integration requires the use of opaque access tokens in view of company policies, please get in touch with us.
+Proof Key for Code Exchange (PKCE)
+
+If you desire best practice security for your application, you can optionally use Proof Key for Code Exchange (PKCE). This specification essentially acts as a one-time password for each individual client in order to keep the authorization code secure.
+
+    Similar to the state parameter, you have to generate and store a random value named the "code_verifier". This value must be kept secret. From this value, your application must derive a transformed version, referred to as the "code_challenge", which is sent in the authorization request along with the transformation method "code_challenge_method".
+
+    The authorization server responds as usual but stores the code_challenge and code_challenge_method.
+
+    Your application should then send the authorization code in the access token request as usual but includes the code_verifier secret value generated in the first step.
+
+    The authorization server transforms the code_verifier value using the code_challenge_method and compares it to the value of code_challenge it stored in step (2). Access is denied if these values are not equal.
+
+An attacker who intercepts the authorization code is unable to redeem it for an access token, as they are not in possession of the "code_verifier" secret.
+Token validation
+
+Tokens issued by the Onecta Identity Provider can be validated through several ways.
+
+Applications can introspect their access and refresh tokens for the purpose of checking their validity. This validation is performed server-side at the Identity Provider for both opaque and JWT tokens. Introspection informs the application if the token is valid and provides metadata about the token such as approved scopes.
+
+Applications can also validate tokens on the client side by using the data retrieved from the JSON Web Key Set (JWKS) endpoint. This set of keys contains the public keys used to verify any JSON Web Token (JWT) issued by the Authorization Server.
+Token introspection
+
+To perform token introspection, you must submit the token as a query parameter along with a basic authorization header containing the base64 encoding of your "client_id:client_secret".
+
+For further details, please refer to the introspection specification.
+
+Request example
+
+
+
+
+
+
+
+
+
+
+
+
+
+POST https://idp.onecta.daikineurope.com/v1/oidc/introspect?token=[YOUR_TOKEN]
+
+Header:
+Authorization: Basic <base64 encoding of client_id:client_secret>
+
+
+
+Copy
+
+Response example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+  "active": true,
+  "scope": "openid onecta:basic.integration",
+  "iat": 1656051489,
+  "exp": 1656055089,
+  "client_id": "emU20GdJDiiUxI_HnFGz69dD",
+  "aud": "emU20GdJDiiUxI_HnFGz69dD",
+  "iss": "https://fidm.gigya.com/oidc/op/v1.0/3_xRB3jaQ62bVjqXU1omaEsPDVYC0Twi1zfq1zHPu_5HFT0zWkDvZJS97Yw1loJnTm",
+  "sub": "123456789",
+  "token_type": "Bearer"
+}
+
+
+
+Copy
+
+If the token provided is invalid, the identity provider will respond with the following:
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+    "active": false
+}
+
+
+
+Copy
+JWKS endpoint
+
+The JWKS endpoint is available on :
+
+
+
+https://idp.onecta.daikineurope.com/v1/oidc/.well-known/jwks
+
+
+
+Copy
+
+Response example
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+200 OK
+{
+  "keys": [
+    {
+      "alg": "RS256",
+      "e": "AQAB",
+      "kid": "MjQwMjg1Q0NG-dont-use-this-5NERBOTdBQzhFRjgzNw",
+      "kty": "RSA",
+      "n": "uG-Rs2ZA7UZv-wXm0GUcvukF0t05dfg_SFyyPTCfK2qMNYPXwmBqLZkXu6lM3yE5TWdont-use-this-XMpk_6ZnSeOPuDzbMpQP6h1G5jxHWFa-5mOfVpu-EeW73otFVw",
+      "use": "sig"
+    }
+  ]
+}
+
+
+
+Copy
+Known limitations
+
+The maximum lifetime of the authorization session is 1 year. After this period, the access and refresh token will expire. Users will then need to re-authorize their integration to gain access again to the API. Otherwise, requests will result in a HTTP 401 Unauthorized error.
+
+⚠️ Warning:Take into account that token introspection of the refresh token only shows the actual expiration timestamp of the token if refresh token rotation would be disabled. This expiration timestamp is found in the exp field, presented as seconds since UNIX epoch. By default, refresh token rotation is enabled for all applications created via the developer portal to enhance security.

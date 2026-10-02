@@ -7,5 +7,6 @@ RUN cargo tree
 RUN cargo install --path .
 
 FROM amd64/alpine:3.19 as runtime
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /usr/local/cargo/bin/daikin2mqtt /usr/local/bin/daikin2mqtt
 ENTRYPOINT ["daikin2mqtt"]

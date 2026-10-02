@@ -1,268 +1,485 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use openid::Configurable;
+use oauth2::{
+    basic::{BasicClient, BasicErrorResponseType, BasicTokenResponse, BasicTokenType},
+    AccessToken, AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
+    HttpClientError, HttpRequest, HttpResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    RequestTokenError, RevocationUrl, Scope, StandardRevocableToken, TokenResponse, TokenUrl,
+};
 use reqwest::{StatusCode, Url};
 
 use crate::MqttBridgeError;
 
-const ISSUER: &str = "https://api.onecta.daikineurope.com";
 const API: &str = "https://api.onecta.daikineurope.com/v1/";
 const AUTH_URI: &str = "https://idp.onecta.daikineurope.com/v1/oidc/authorize";
 const TOKEN_URI: &str = "https://idp.onecta.daikineurope.com/v1/oidc/token";
-const REDIRECT: &str = "onectaintegration://callback/";
+const REVOKE_URI: &str = "https://idp.onecta.daikineurope.com/v1/oidc/revoke";
 
-struct OnectaProvider {
-    config: openid::Config,
-}
-
-impl Configurable for OnectaProvider {
-    fn config(&self) -> &openid::Config {
-        &self.config
-    }
-}
-
-impl openid::Provider for OnectaProvider {
-    fn auth_uri(&self) -> &Url {
-        &self.config.authorization_endpoint
-    }
-
-    fn token_uri(&self) -> &Url {
-        &self.config.token_endpoint
-    }
-}
-impl OnectaProvider {
-    fn new() -> Self {
-        let config = openid::Config {
-            issuer: Url::parse(ISSUER).unwrap(),
-            authorization_endpoint: Url::parse(AUTH_URI).unwrap(),
-            token_endpoint: Url::parse(TOKEN_URI).unwrap(),
-            jwks_uri: Url::parse("https://idp.onecta.daikineurope.com/v1/oidc/jwks").unwrap(),
-            response_types_supported: vec!["code".to_string()],
-            subject_types_supported: vec!["public".to_string()],
-            id_token_signing_alg_values_supported: vec!["RS256".to_string()],
-            token_endpoint_auth_methods_supported: Some(vec!["client_secret_basic".to_string()]),
-            scopes_supported: Some(vec!["openid".to_string()]),
-            token_introspection_endpoint: None,
-            userinfo_endpoint: None,
-            end_session_endpoint: None,
-            registration_endpoint: None,
-            response_modes_supported: None,
-            grant_types_supported: None,
-            acr_values_supported: None,
-            id_token_encryption_alg_values_supported: None,
-            id_token_encryption_enc_values_supported: None,
-            userinfo_signing_alg_values_supported: None,
-            userinfo_encryption_alg_values_supported: None,
-            userinfo_encryption_enc_values_supported: None,
-            request_object_signing_alg_values_supported: None,
-            request_object_encryption_alg_values_supported: None,
-            request_object_encryption_enc_values_supported: None,
-            token_endpoint_auth_signing_alg_values_supported: None,
-            display_values_supported: None,
-            claim_types_supported: None,
-            claims_supported: None,
-            service_documentation: None,
-            claims_locales_supported: None,
-            ui_locales_supported: None,
-            claims_parameter_supported: false,
-            request_parameter_supported: false,
-            request_uri_parameter_supported: true,
-            require_request_uri_registration: false,
-            op_policy_uri: None,
-            op_tos_uri: None,
-            code_challenge_methods_supported: None,
-        };
-
-        OnectaProvider { config }
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    // Absolute expiry avoids treating a saved timestamp as a fresh token lifetime on restart.
+    #[serde(default, alias = "expires_in")]
+    expires_at: u64,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct AuthenticationData {
-    token: Option<openid::Bearer>,
-    auth_code: String,
+    token: Option<StoredToken>,
+    #[serde(default)]
+    revocation_pending: bool,
+}
+
+struct PendingAuthorization {
+    url: Url,
+    state: CsrfToken,
+    verifier: PkceCodeVerifier,
+}
+
+struct PendingCode {
+    code: String,
+    verifier: PkceCodeVerifier,
 }
 
 pub struct DaikinCloudConnection {
     http_client: reqwest::Client,
-    openid_client: openid::Client<OnectaProvider>,
-    data_dir: std::path::PathBuf,
+    oauth_client: BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointSet, EndpointSet>,
+    redirect_uri: String,
+    api: String,
+    data_dir: PathBuf,
     authentication_data: AuthenticationData,
+    pending_authorization: Option<PendingAuthorization>,
+    pending_code: Option<PendingCode>,
+    persistence_pending: bool,
+    deletion_pending: bool,
 }
 
 impl DaikinCloudConnection {
-    pub fn new(client_id: String, client_secret: String, data_dir: &Path) -> DaikinCloudConnection {
-        let authentication_data = DaikinCloudConnection::restore_authentication_data(data_dir).unwrap_or_default();
-
-        let openid_client: openid::Client<_> = openid::Client::new(
-            OnectaProvider::new(),
-            client_id,
-            client_secret,
-            REDIRECT.to_string(),
-            reqwest::Client::new(),
-            None,
-        );
-
-        DaikinCloudConnection {
-            http_client: reqwest::Client::new(),
-            openid_client,
+    pub fn new(
+        client_id: String,
+        client_secret: String,
+        redirect_uri: String,
+        data_dir: &Path,
+    ) -> Result<Self, MqttBridgeError> {
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(MqttBridgeError::RuntimeError(
+                "OAuth client credentials must not be empty".into(),
+            ));
+        }
+        let redirect = RedirectUrl::new(redirect_uri.clone())
+            .map_err(|_| MqttBridgeError::RuntimeError("Invalid OAuth redirect URI".into()))?;
+        if redirect.url().query().is_some() || redirect.url().fragment().is_some() {
+            return Err(MqttBridgeError::RuntimeError(
+                "OAuth redirect URI must not contain a query or fragment".into(),
+            ));
+        }
+        let oauth_client = BasicClient::new(ClientId::new(client_id))
+            .set_client_secret(ClientSecret::new(client_secret))
+            .set_auth_uri(AuthUrl::new(AUTH_URI.into()).map_err(|_| MqttBridgeError::ParseError)?)
+            .set_token_uri(TokenUrl::new(TOKEN_URI.into()).map_err(|_| MqttBridgeError::ParseError)?)
+            .set_auth_type(AuthType::RequestBody)
+            .set_redirect_uri(redirect)
+            .set_revocation_url(RevocationUrl::new(REVOKE_URI.into()).map_err(|_| MqttBridgeError::ParseError)?);
+        let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| MqttBridgeError::NetworkError("Failed to create HTTP client".into()))?;
+        let authentication_data = Self::restore_authentication_data(data_dir)?;
+        let mut connection = Self {
+            http_client,
+            oauth_client,
+            redirect_uri,
+            api: API.into(),
             data_dir: data_dir.to_path_buf(),
             authentication_data,
-        }
-    }
-
-    fn auth_url(&self) -> Url {
-        let options = openid::Options {
-            scope: Some("openid onecta:basic.integration".to_string()),
-            state: Some("123456".to_string()),
-            nonce: None,
-            display: None,
-            prompt: None,
-            max_age: None,
-            ui_locales: None,
-            claims_locales: None,
-            id_token_hint: None,
-            login_hint: None,
-            acr_values: None,
+            pending_authorization: None,
+            pending_code: None,
+            persistence_pending: false,
+            deletion_pending: false,
         };
-
-        self.openid_client.auth_url(&options)
+        // Migrate legacy files, remove saved single-use codes, and enforce private file permissions.
+        if connection.authentication_data.token.is_some() {
+            connection.store_authentication_data()?;
+        }
+        Ok(connection)
     }
 
-    pub fn set_authorization_code(&mut self, code: String) {
-        self.clear_authentication_data();
-        self.authentication_data.auth_code = code;
+    fn auth_url(&mut self) -> Url {
+        let pending = self.pending_authorization.get_or_insert_with(|| {
+            let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+            let (url, state) = self
+                .oauth_client
+                .authorize_url(CsrfToken::new_random)
+                .add_scope(Scope::new("openid".into()))
+                .add_scope(Scope::new("onecta:basic.integration".into()))
+                .add_scope(Scope::new("offline_access".into()))
+                .set_pkce_challenge(challenge)
+                .url();
+            PendingAuthorization { url, state, verifier }
+        });
+        pending.url.clone()
+    }
+
+    pub fn set_authorization_code(&mut self, callback: String) -> Result<(), MqttBridgeError> {
+        let invalid = || {
+            MqttBridgeError::RuntimeError(
+                "Invalid authorization callback: submit the full redirect URL with code and matching state".into(),
+            )
+        };
+        let mut url = Url::parse(callback.trim()).map_err(|_| invalid())?;
+        if url.fragment().is_some() {
+            return Err(invalid());
+        }
+        let mut code = None;
+        let mut state = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "code" if code.is_none() => code = Some(value.into_owned()),
+                "state" if state.is_none() => state = Some(value.into_owned()),
+                "code" | "state" | "error" => return Err(invalid()),
+                _ => {}
+            }
+        }
+        url.set_query(None);
+        let redirect = Url::parse(&self.redirect_uri).map_err(|_| invalid())?;
+        let pending = self.pending_authorization.as_ref().ok_or_else(invalid)?;
+        let returned_state = CsrfToken::new(state.ok_or_else(invalid)?);
+        if url != redirect || returned_state != pending.state {
+            return Err(invalid());
+        }
+        let code = code.filter(|value| !value.is_empty()).ok_or_else(invalid)?;
+        if self.authentication_data.token.is_some() {
+            return Err(MqttBridgeError::RuntimeError(
+                "Revoke the existing integration before authorizing again".into(),
+            ));
+        }
+        let pending = self.pending_authorization.take().ok_or_else(invalid)?;
+        self.pending_code = Some(PendingCode {
+            code,
+            verifier: pending.verifier,
+        });
+        Ok(())
     }
 
     pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
-        log::info!("Updating cloud connection");
-
-        if self.authentication_data.auth_code.is_empty() {
-            return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()));
+        if self.deletion_pending {
+            self.remove_authentication_file()?;
         }
-
-        if self.authentication_data.token.is_none() {
-            log::info!("Obtain access token");
-            match self.obtain_access_token().await {
-                Ok(_) => log::debug!("Token obtained"),
-                Err(MqttBridgeError::NotAuhrorized) => {
-                    return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()))
-                }
-                Err(err) => return Err(err),
-            }
+        if self.persistence_pending {
             self.store_authentication_data()?;
-        } else {
-            log::debug!(
-                "Token present: {}",
-                self.authentication_data.token.as_ref().unwrap().access_token
-            );
         }
-
-        if let Some(token) = self.authentication_data.token.take() {
-            self.authentication_data.token = Some(self.openid_client.ensure_token(token).await.unwrap());
-        } else {
-            log::info!("No token present");
-            return Err(MqttBridgeError::NotAuhrorized);
+        if self.authentication_data.revocation_pending {
+            return Err(MqttBridgeError::RuntimeError(
+                "Revocation pending; retry revoke_authorization before accessing the cloud".into(),
+            ));
         }
-
-        Ok(self.update_status().await?)
-    }
-
-    async fn obtain_access_token(&mut self) -> Result<(), MqttBridgeError> {
-        match self
-            .openid_client
-            .request_token(&self.authentication_data.auth_code)
-            .await
+        if self.authentication_data.token.is_none() {
+            let Some(code) = self.pending_code.as_ref() else {
+                return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()));
+            };
+            let result = self
+                .oauth_client
+                .exchange_code(AuthorizationCode::new(code.code.clone()))
+                .set_pkce_verifier(PkceCodeVerifier::new(code.verifier.secret().clone()))
+                .request_async(&|request| self.oauth_http(request))
+                .await;
+            match result {
+                Ok(token) => {
+                    self.pending_code = None;
+                    self.accept_token(token)?;
+                }
+                Err(RequestTokenError::ServerResponse(ref error))
+                    if *error.error() == BasicErrorResponseType::InvalidGrant =>
+                {
+                    return Err(self.authorization_required()?);
+                }
+                Err(_) => {
+                    return Err(MqttBridgeError::NetworkError(
+                        "Authorization code exchange failed; check OAuth credentials and provider availability".into(),
+                    ))
+                }
+            }
+        }
+        if self
+            .authentication_data
+            .token
+            .as_ref()
+            .is_some_and(|token| token.expires_at <= now().saturating_add(30))
         {
-            Ok(token) => {
-                self.authentication_data.token = Some(token);
-                log::info!("Access token obtained: {:?}", self.authentication_data.token);
-                Ok(())
+            self.refresh_access_token().await?;
+        }
+        let response = self.gateway_devices().await?;
+        let response = if response.status() == StatusCode::UNAUTHORIZED {
+            self.refresh_access_token().await?;
+            self.gateway_devices().await?
+        } else {
+            response
+        };
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(self.authorization_required()?);
+        }
+        if !response.status().is_success() {
+            return Err(MqttBridgeError::NetworkError(format!(
+                "Gateway device request failed: {}",
+                response.status()
+            )));
+        }
+        response
+            .text()
+            .await
+            .map_err(|_| MqttBridgeError::NetworkError("Failed to read gateway devices".into()))
+    }
+
+    async fn refresh_access_token(&mut self) -> Result<(), MqttBridgeError> {
+        let refresh = self
+            .authentication_data
+            .token
+            .as_ref()
+            .and_then(|token| token.refresh_token.clone());
+        let Some(refresh) = refresh.filter(|value| !value.is_empty()) else {
+            return Err(self.authorization_required()?);
+        };
+        let refresh = RefreshToken::new(refresh);
+        let result = self
+            .oauth_client
+            .exchange_refresh_token(&refresh)
+            .request_async(&|request| self.oauth_http(request))
+            .await;
+        match result {
+            Ok(mut token) => {
+                // RFC 6749 permits omission of an unchanged refresh token.
+                if token.refresh_token().is_none() {
+                    token.set_refresh_token(Some(refresh));
+                }
+                self.accept_token(token)
             }
-            Err(err) => {
-                log::error!("Failed to obtain access token: {}", err);
-                Err(MqttBridgeError::NotAuhrorized)
+            Err(RequestTokenError::ServerResponse(ref error))
+                if *error.error() == BasicErrorResponseType::InvalidGrant =>
+            {
+                Err(self.authorization_required()?)
             }
+            Err(_) => Err(MqttBridgeError::NetworkError(
+                "Token refresh failed; stored refresh token retained for retry".into(),
+            )),
         }
     }
 
-    async fn update_status(&mut self) -> Result<String, MqttBridgeError> {
-        // Perform a request to the cloud API to update the status of the devices
-        let url = format!("{}gateway-devices", API);
+    fn accept_token(&mut self, token: BasicTokenResponse) -> Result<(), MqttBridgeError> {
+        if token.token_type() != &BasicTokenType::Bearer || token.access_token().secret().is_empty() {
+            return Err(MqttBridgeError::RuntimeError(
+                "Provider did not return a Bearer access token".into(),
+            ));
+        }
+        let lifetime = token
+            .expires_in()
+            .ok_or_else(|| MqttBridgeError::RuntimeError("Provider omitted token expiry".into()))?;
+        self.authentication_data.token = Some(StoredToken {
+            access_token: token.access_token().secret().clone(),
+            refresh_token: token.refresh_token().map(|value| value.secret().clone()),
+            expires_at: now().saturating_add(lifetime.as_secs()),
+        });
+        self.persistence_pending = true;
+        self.store_authentication_data()
+    }
 
-        log::debug!("Updating status: {}", url);
-
-        let res = self
-            .http_client
-            .get(&url)
+    async fn gateway_devices(&self) -> Result<reqwest::Response, MqttBridgeError> {
+        let token = self
+            .authentication_data
+            .token
+            .as_ref()
+            .ok_or(MqttBridgeError::NotAuhrorized)?;
+        self.http_client
+            .get(format!("{}gateway-devices", self.api))
             .header("Accept", "application/json")
-            .header(
-                "Authorization",
-                format!(
-                    "Bearer {}",
-                    self.authentication_data.token.as_ref().unwrap().access_token
-                ),
-            )
+            .bearer_auth(&token.access_token)
             .send()
             .await
-            .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to obtain access token: {}", err)))?;
+            .map_err(|_| MqttBridgeError::NetworkError("Gateway device request failed".into()))
+    }
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            Err(MqttBridgeError::AuthorizationRequired(self.auth_url()))
-        } else if res.status().is_success() {
-            let body = res
-                .text()
-                .await
-                .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to read response: {}", err)))?;
-            Ok(body)
-        } else {
-            Err(MqttBridgeError::NetworkError(format!(
-                "Failed to obtain gateway devices: {} {}",
-                res.status(),
-                res.text().await.unwrap(),
-            )))
+    pub async fn revoke_authorization(&mut self) -> Result<(), MqttBridgeError> {
+        if self.authentication_data.token.is_some() {
+            // Persist intent before contacting the provider so restarts cannot resume a
+            // partly revoked integration or rotate away credentials needed for retry.
+            self.authentication_data.revocation_pending = true;
+            self.persistence_pending = true;
+            self.store_authentication_data()?;
         }
+        let mut failed = false;
+        if let Some(token) = self.authentication_data.token.as_ref() {
+            let mut tokens = vec![StandardRevocableToken::AccessToken(AccessToken::new(
+                token.access_token.clone(),
+            ))];
+            if let Some(refresh) = &token.refresh_token {
+                tokens.push(StandardRevocableToken::RefreshToken(RefreshToken::new(refresh.clone())));
+            }
+            // Attempt both, even if the first fails; retain local tokens on failure to allow retry.
+            for token in tokens {
+                let request = self
+                    .oauth_client
+                    .revoke_token(token)
+                    .map_err(|_| MqttBridgeError::RuntimeError("Invalid revocation endpoint".into()))?;
+                if request
+                    .request_async(&|request| self.oauth_http(request))
+                    .await
+                    .is_err()
+                {
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            return Err(MqttBridgeError::NetworkError(
+                "Token revocation failed; retry revoke_authorization".into(),
+            ));
+        }
+        self.clear_authentication_data()
+    }
+
+    // oauth2 handles protocol requests and responses. This adapter reuses our bounded,
+    // non-redirecting HTTP client and accepts ONECTA's documented omission of token_type.
+    async fn oauth_http(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError<reqwest::Error>> {
+        #[cfg(test)]
+        let request = tests::loopback_oauth_request(request);
+        let revocation = request.uri().path().ends_with("/revoke");
+        let (parts, body) = request.into_parts();
+        let response = self
+            .http_client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?;
+        let status_code = response.status();
+        let headers = response.headers().clone();
+        let mut body = response
+            .bytes()
+            .await
+            .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?
+            .to_vec();
+        if status_code.is_success() && revocation && !body.is_empty() {
+            let envelope: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| HttpClientError::Other("Invalid revocation response".into()))?;
+            if envelope.get("errorCode").and_then(serde_json::Value::as_u64) != Some(0) {
+                return Err(HttpClientError::Other(
+                    "Provider reported token revocation failure".into(),
+                ));
+            }
+        }
+        if status_code.is_success() && !revocation {
+            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                if let Some(object) = json.as_object_mut() {
+                    if object.contains_key("access_token") && !object.contains_key("token_type") {
+                        object.insert("token_type".into(), serde_json::Value::String("Bearer".into()));
+                        if let Ok(normalized) = serde_json::to_vec(&json) {
+                            body = normalized;
+                        }
+                    }
+                }
+            }
+        }
+        let mut result = HttpResponse::new(body);
+        *result.status_mut() = status_code;
+        *result.headers_mut() = headers;
+        Ok(result)
+    }
+
+    fn authorization_required(&mut self) -> Result<MqttBridgeError, MqttBridgeError> {
+        self.clear_authentication_data()?;
+        Ok(MqttBridgeError::AuthorizationRequired(self.auth_url()))
     }
 
     fn authentication_data_path(base_dir: &Path) -> PathBuf {
         base_dir.join("openid_authentication.json")
     }
 
-    fn clear_authentication_data(&mut self) {
+    fn clear_authentication_data(&mut self) -> Result<(), MqttBridgeError> {
         self.authentication_data = AuthenticationData::default();
-        if let Err(err) = std::fs::remove_file(DaikinCloudConnection::authentication_data_path(&self.data_dir)) {
-            log::warn!("Failed to remove file: {}", err);
+        self.pending_code = None;
+        self.pending_authorization = None;
+        self.persistence_pending = false;
+        self.deletion_pending = true;
+        self.remove_authentication_file()
+    }
+
+    fn remove_authentication_file(&mut self) -> Result<(), MqttBridgeError> {
+        match fs::remove_file(Self::authentication_data_path(&self.data_dir)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(MqttBridgeError::RuntimeError(
+                    "Failed to remove stored authentication data; cleanup will be retried".into(),
+                ))
+            }
         }
+        #[cfg(unix)]
+        if self.data_dir.exists() {
+            fs::File::open(&self.data_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| MqttBridgeError::RuntimeError("Failed to synchronize authentication cleanup".into()))?;
+        }
+        self.deletion_pending = false;
+        Ok(())
     }
 
     fn store_authentication_data(&mut self) -> Result<(), MqttBridgeError> {
-        let path = DaikinCloudConnection::authentication_data_path(&self.data_dir);
-        if !self.authentication_data.auth_code.is_empty() {
-            let json_str = serde_json::to_string(&self.authentication_data)?;
-            fs::create_dir_all(path.parent().unwrap())
-                .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to create directory: {}", err)))?;
-            std::fs::write(path, json_str)
-                .map_err(|err| MqttBridgeError::NetworkError(format!("Failed to write file: {}", err)))?;
-        } else {
-            self.clear_authentication_data();
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| MqttBridgeError::RuntimeError("Failed to create authentication directory".into()))?;
+        let temporary = self
+            .data_dir
+            .join(format!(".authentication-{}.tmp", CsrfToken::new_random().secret()));
+        let result = (|| -> Result<(), MqttBridgeError> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(serde_json::to_string(&self.authentication_data)?.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, Self::authentication_data_path(&self.data_dir))?;
+            #[cfg(unix)]
+            fs::File::open(&self.data_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err(MqttBridgeError::RuntimeError(
+                "Failed to securely persist authentication data".into(),
+            ));
         }
-
+        self.persistence_pending = false;
         Ok(())
     }
 
     fn restore_authentication_data(data_dir: &Path) -> Result<AuthenticationData, MqttBridgeError> {
-        let path = DaikinCloudConnection::authentication_data_path(&data_dir);
-        if path.exists() {
-            let json_str = std::fs::read_to_string(&path)
-                .map_err(|err| MqttBridgeError::RuntimeError(format!("Failed to read file: {}", err)))?;
-            let auth_data: AuthenticationData = serde_json::from_str(&json_str)
-                .map_err(|err| MqttBridgeError::RuntimeError(format!("Failed to parse file: {}", err)))?;
-            return Ok(auth_data);
+        match fs::read_to_string(Self::authentication_data_path(data_dir)) {
+            Ok(json) => serde_json::from_str(&json)
+                .map_err(|_| MqttBridgeError::RuntimeError("Failed to parse authentication file".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AuthenticationData::default()),
+            Err(_) => Err(MqttBridgeError::RuntimeError(
+                "Failed to read authentication file".into(),
+            )),
         }
-
-        Ok(AuthenticationData::default())
     }
+}
+
+#[cfg(test)]
+mod tests;
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
