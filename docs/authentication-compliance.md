@@ -9,7 +9,6 @@ Configure your own application credentials from the Daikin developer portal. The
 | CLI option | Environment variable | Default |
 | --- | --- | --- |
 | `--daikin-client-id` | `DAIKIN_OAUTH_CLIENT_ID` | Required |
-| `--daikin-client-secret` | `DAIKIN_OAUTH_CLIENT_SECRET` | Required |
 | `--daikin-redirect-uri` | `DAIKIN_REDIRECT_URI` | `onectaintegration://callback/` |
 | `--data-dir` | `DAIKIN_DATA_DIR` | `./data` |
 
@@ -17,7 +16,29 @@ Configure your own application credentials from the Daikin developer portal. The
 
 The redirect URI must exactly match the URI registered for your application, including its scheme, path, and trailing slash. The configured value is used in both authorization and code-exchange requests. Redirect URIs with a query string or fragment are rejected. The bridge does not host an HTTP callback server or install a custom-scheme handler: submit the final redirected URL manually over MQTT.
 
-Prefer injecting secrets through your deployment's secret manager/environment instead of command-line arguments, shell history, or checked-in configuration. OAuth and MQTT secret environment values are hidden from CLI help.
+### Secrets via SecretSpec
+
+The application uses the SecretSpec Rust SDK to resolve credentials from the declarations in `secretspec.toml` before starting the bridge. The manifest is embedded at build time, so installed binaries and Docker containers do not need a runtime copy. Changing the declarations requires rebuilding the application; secret values are never embedded.
+
+| SecretSpec name | Purpose | Requirement |
+| --- | --- | --- |
+| `DAIKIN_CLIENT_SECRET` | Daikin OAuth client secret | Required |
+| `MQTT_USERNAME` | MQTT broker username | Required |
+| `MQTT_PASSWORD` | MQTT broker password | Required |
+
+Provider and profile selection use SecretSpec's configuration and the `SECRETSPEC_PROVIDER` / `SECRETSPEC_PROFILE` environment variables. This build enables the keyring provider as well as the SDK's always-available providers, including environment variables and dotenv. Optional cloud-provider features are not enabled. All three credentials are validated non-interactively; a missing credential causes startup to fail rather than prompting or connecting anonymously to MQTT. The application resolves the entire profile regardless of `SECRETSPEC_SCOPE`.
+
+For a deployment that injects secrets as environment variables, set `SECRETSPEC_PROVIDER=env` and supply the three names above through your deployment's secret manager. Non-secret options remain CLI/environment settings:
+
+```sh
+SECRETSPEC_PROVIDER=env cargo run --locked -- \
+  --mqtt-addr localhost \
+  --daikin-client-id your-registered-oauth-client-id
+```
+
+For a private dotenv file, set `SECRETSPEC_PROVIDER=dotenv:/absolute/path/to/secrets.env`. Protect the file with restrictive permissions and never commit it. An SDK default audit reason identifies bridge initialization; `SECRETSPEC_REASON` can supply a more specific reason.
+
+**Migration:** `--daikin-client-secret`, `--mqtt-user`, and `--mqtt-pass` are no longer accepted. Replace the old `DAIKIN_OAUTH_CLIENT_SECRET`, `DAIKIN_MQTT_USER`, and `DAIKIN_MQTT_PASS` variables with `DAIKIN_CLIENT_SECRET`, `MQTT_USERNAME`, and `MQTT_PASSWORD`, respectively, when using the environment provider. MQTT credentials are now required, matching the existing manifest. Secrets are not parsed by Clap or displayed in CLI help.
 
 ## Authorizing the integration
 
@@ -73,7 +94,7 @@ The current MQTT transport is plain TCP, not TLS. Use a protected local connecti
 
 ## Verification
 
-`src/daikincloudconnection/tests.rs` uses local mock endpoints to exercise authorization, redirect/state/PKCE validation, token exchange and Bearer usage, expiry/rotation/restart behavior, legacy migration, network and persistence failure recovery, bounded 401 retries, and both-token revocation including partial failures and provider error envelopes. CLI tests verify required credentials, redirect configuration, and secret hiding.
+`src/daikincloudconnection/tests.rs` uses local mock endpoints to exercise authorization, redirect/state/PKCE validation, token exchange and Bearer usage, expiry/rotation/restart behavior, legacy migration, network and persistence failure recovery, bounded 401 retries, and both-token revocation including partial failures and provider error envelopes. CLI/SDK tests verify the required OAuth client ID, redirect configuration, absence of secret CLI options, embedded-manifest loading through an isolated dotenv provider, credential-to-bridge mapping, and missing-secret failures without value disclosure.
 
 These tests verify the implementation against the supplied documentation without contacting a real Daikin account. Live authorization, the registered redirect URI, application scopes, and account-specific provider behavior still require deployment validation.
 
