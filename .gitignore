@@ -1,4 +1,6 @@
 target
+/result
+/result-*
 .DS_Store
 data/openid_authentication.json
 

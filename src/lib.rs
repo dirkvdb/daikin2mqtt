@@ -3,6 +3,7 @@ pub mod bridge;
 mod daikincloudconnection;
 //mod hassdiscovery;
 pub mod mqtt;
+mod web;
 
 use std::{array::TryFromSliceError, fmt, net::AddrParseError, str::Utf8Error};
 

@@ -4,8 +4,10 @@ build:
 prod:
   cargo run --release -- --mqtt-addr=192.168.1.17 --mqtt-base-topic home/daikin
 
+# Build and load the AMD64 Nix image without publishing it.
 docker:
-  docker build -t dirkvdb/daikin2mqtt:latest -f docker/BuildDockerfile .
+  nix build .#packages.x86_64-linux.container --out-link result-container
+  docker load --input result-container
 
-dockerup:
+dockerup: docker
   docker push dirkvdb/daikin2mqtt:latest

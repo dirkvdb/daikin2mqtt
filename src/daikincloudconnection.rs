@@ -47,6 +47,15 @@ struct PendingCode {
     verifier: PkceCodeVerifier,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuthenticationState {
+    Unauthorized,
+    Authorizing,
+    Authorized,
+    RevocationPending,
+}
+
 pub struct DaikinCloudConnection {
     http_client: reqwest::Client,
     oauth_client: BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointSet, EndpointSet>,
@@ -127,10 +136,66 @@ impl DaikinCloudConnection {
         pending.url.clone()
     }
 
+    pub(crate) fn authentication_state(&self) -> AuthenticationState {
+        if self.authentication_data.revocation_pending {
+            AuthenticationState::RevocationPending
+        } else if self.authentication_data.token.is_some() {
+            AuthenticationState::Authorized
+        } else if self.pending_code.is_some() {
+            AuthenticationState::Authorizing
+        } else {
+            AuthenticationState::Unauthorized
+        }
+    }
+
+    pub(crate) fn begin_authorization(&mut self) -> Result<Url, MqttBridgeError> {
+        if self.deletion_pending {
+            self.remove_authentication_file()?;
+        }
+        if self.authentication_data.token.is_some() || self.authentication_data.revocation_pending {
+            return Err(MqttBridgeError::RuntimeError(
+                "Disconnect the existing integration before authorizing again".into(),
+            ));
+        }
+        if self.pending_code.is_some() {
+            return Err(MqttBridgeError::RuntimeError(
+                "Authorization is already being completed; wait for the connection status to update".into(),
+            ));
+        }
+        Ok(self.auth_url())
+    }
+
+    pub(crate) async fn exchange_pending_code(&mut self) -> Result<(), MqttBridgeError> {
+        let Some(code) = self.pending_code.as_ref() else {
+            return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()));
+        };
+        let result = self
+            .oauth_client
+            .exchange_code(AuthorizationCode::new(code.code.clone()))
+            .set_pkce_verifier(PkceCodeVerifier::new(code.verifier.secret().clone()))
+            .request_async(&|request| self.oauth_http(request))
+            .await;
+        match result {
+            Ok(token) => {
+                self.pending_code = None;
+                self.accept_token(token)
+            }
+            Err(RequestTokenError::ServerResponse(ref error))
+                if *error.error() == BasicErrorResponseType::InvalidGrant =>
+            {
+                Err(self.authorization_required()?)
+            }
+            Err(_) => Err(MqttBridgeError::NetworkError(
+                "Authorization code exchange failed; check OAuth credentials and provider availability".into(),
+            )),
+        }
+    }
+
     pub fn set_authorization_code(&mut self, callback: String) -> Result<(), MqttBridgeError> {
         let invalid = || {
             MqttBridgeError::RuntimeError(
-                "Invalid authorization callback: submit the full redirect URL with code and matching state".into(),
+                "Invalid authorization callback: expected the registered redirect URL with code and matching state"
+                    .into(),
             )
         };
         let mut url = Url::parse(callback.trim()).map_err(|_| invalid())?;
@@ -177,35 +242,11 @@ impl DaikinCloudConnection {
         }
         if self.authentication_data.revocation_pending {
             return Err(MqttBridgeError::RuntimeError(
-                "Revocation pending; retry revoke_authorization before accessing the cloud".into(),
+                "Revocation pending; retry disconnect in the web UI before accessing the cloud".into(),
             ));
         }
         if self.authentication_data.token.is_none() {
-            let Some(code) = self.pending_code.as_ref() else {
-                return Err(MqttBridgeError::AuthorizationRequired(self.auth_url()));
-            };
-            let result = self
-                .oauth_client
-                .exchange_code(AuthorizationCode::new(code.code.clone()))
-                .set_pkce_verifier(PkceCodeVerifier::new(code.verifier.secret().clone()))
-                .request_async(&|request| self.oauth_http(request))
-                .await;
-            match result {
-                Ok(token) => {
-                    self.pending_code = None;
-                    self.accept_token(token)?;
-                }
-                Err(RequestTokenError::ServerResponse(ref error))
-                    if *error.error() == BasicErrorResponseType::InvalidGrant =>
-                {
-                    return Err(self.authorization_required()?);
-                }
-                Err(_) => {
-                    return Err(MqttBridgeError::NetworkError(
-                        "Authorization code exchange failed; check OAuth credentials and provider availability".into(),
-                    ))
-                }
-            }
+            self.exchange_pending_code().await?;
         }
         if self
             .authentication_data
@@ -337,7 +378,7 @@ impl DaikinCloudConnection {
         }
         if failed {
             return Err(MqttBridgeError::NetworkError(
-                "Token revocation failed; retry revoke_authorization".into(),
+                "Token revocation failed; retry disconnect in the web UI".into(),
             ));
         }
         self.clear_authentication_data()
@@ -345,51 +386,58 @@ impl DaikinCloudConnection {
 
     // oauth2 handles protocol requests and responses. This adapter reuses our bounded,
     // non-redirecting HTTP client and accepts ONECTA's documented omission of token_type.
-    async fn oauth_http(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError<reqwest::Error>> {
-        #[cfg(test)]
-        let request = tests::loopback_oauth_request(request);
-        let revocation = request.uri().path().ends_with("/revoke");
-        let (parts, body) = request.into_parts();
-        let response = self
-            .http_client
-            .request(parts.method, parts.uri.to_string())
-            .headers(parts.headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?;
-        let status_code = response.status();
-        let headers = response.headers().clone();
-        let mut body = response
-            .bytes()
-            .await
-            .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?
-            .to_vec();
-        if status_code.is_success() && revocation && !body.is_empty() {
-            let envelope: serde_json::Value = serde_json::from_slice(&body)
-                .map_err(|_| HttpClientError::Other("Invalid revocation response".into()))?;
-            if envelope.get("errorCode").and_then(serde_json::Value::as_u64) != Some(0) {
-                return Err(HttpClientError::Other(
-                    "Provider reported token revocation failure".into(),
-                ));
+    fn oauth_http(
+        &self,
+        request: HttpRequest,
+    ) -> impl std::future::Future<Output = Result<HttpResponse, HttpClientError<reqwest::Error>>> + Send + 'static {
+        // Own the cheap client handle so HTTP handlers can await this future without
+        // borrowing the whole cloud connection through oauth2's higher-ranked adapter.
+        let http_client = self.http_client.clone();
+        async move {
+            #[cfg(test)]
+            let request = tests::loopback_oauth_request(request);
+            let revocation = request.uri().path().ends_with("/revoke");
+            let (parts, body) = request.into_parts();
+            let response = http_client
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?;
+            let status_code = response.status();
+            let headers = response.headers().clone();
+            let mut body = response
+                .bytes()
+                .await
+                .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?
+                .to_vec();
+            if status_code.is_success() && revocation && !body.is_empty() {
+                let envelope: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|_| HttpClientError::Other("Invalid revocation response".into()))?;
+                if envelope.get("errorCode").and_then(serde_json::Value::as_u64) != Some(0) {
+                    return Err(HttpClientError::Other(
+                        "Provider reported token revocation failure".into(),
+                    ));
+                }
             }
-        }
-        if status_code.is_success() && !revocation {
-            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Some(object) = json.as_object_mut() {
-                    if object.contains_key("access_token") && !object.contains_key("token_type") {
-                        object.insert("token_type".into(), serde_json::Value::String("Bearer".into()));
-                        if let Ok(normalized) = serde_json::to_vec(&json) {
-                            body = normalized;
+            if status_code.is_success() && !revocation {
+                if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    if let Some(object) = json.as_object_mut() {
+                        if object.contains_key("access_token") && !object.contains_key("token_type") {
+                            object.insert("token_type".into(), serde_json::Value::String("Bearer".into()));
+                            if let Ok(normalized) = serde_json::to_vec(&json) {
+                                body = normalized;
+                            }
                         }
                     }
                 }
             }
+            let mut result = HttpResponse::new(body);
+            *result.status_mut() = status_code;
+            *result.headers_mut() = headers;
+            Ok(result)
         }
-        let mut result = HttpResponse::new(body);
-        *result.status_mut() = status_code;
-        *result.headers_mut() = headers;
-        Ok(result)
     }
 
     fn authorization_required(&mut self) -> Result<MqttBridgeError, MqttBridgeError> {

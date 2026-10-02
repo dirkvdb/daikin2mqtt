@@ -2,6 +2,9 @@ name: Build
 
 on: [push]
 
+permissions:
+  contents: read
+
 jobs:
   compile:
     name: ${{ matrix.cfg.os }}
@@ -14,5 +17,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo test --all-features
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and test flake
+        run: nix flake check --print-build-logs

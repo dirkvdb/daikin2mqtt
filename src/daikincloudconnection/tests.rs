@@ -1404,6 +1404,132 @@ async fn revocation_intent_persistence_failure_blocks_network_until_the_write_ca
 }
 
 #[tokio::test]
+async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
+    use tokio::sync::{Mutex, Notify};
+
+    let directory = TempDirectory::new();
+    let provider = MockServer::new(vec![
+        MockResponse::token("code-access", Some("code-refresh")),
+        MockResponse::success(),
+        MockResponse::success(),
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind web UI");
+    let address = listener.local_addr().expect("web address");
+    let base = format!("http://{address}");
+    let redirect = format!("{base}/oauth/callback");
+    let mut connection = connection_with_redirect(&directory, &redirect);
+    use_mock(&mut connection, &provider);
+    let connection = Arc::new(Mutex::new(connection));
+    let refresh = Arc::new(Notify::new());
+    let web_state = crate::web::WebState::new(connection.clone(), refresh.clone(), redirect.clone(), address)
+        .expect("create web state");
+    let task = tokio::spawn(async move {
+        axum::serve(listener, crate::web::router(web_state))
+            .await
+            .expect("serve web UI");
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("create browser client");
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/auth/status"))
+        .send()
+        .await
+        .expect("fetch status")
+        .json()
+        .await
+        .expect("read status");
+    assert_eq!(status["state"], "unauthorized");
+    let csrf = status["csrf_token"].as_str().expect("CSRF token");
+    let start: serde_json::Value = client
+        .post(format!("{base}/api/auth/start"))
+        .header("x-csrf-token", csrf)
+        .send()
+        .await
+        .expect("begin login")
+        .json()
+        .await
+        .expect("login response");
+    let authorization =
+        query(&Url::parse(start["authorization_url"].as_str().expect("login URL")).expect("parse login URL"));
+    assert_eq!(authorization["redirect_uri"], redirect);
+    let callback_url = callback(&redirect, &[("code", "web-code"), ("state", &authorization["state"])]);
+    let response = client
+        .get(&callback_url)
+        .send()
+        .await
+        .expect("provider browser redirect");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/?auth=success");
+    tokio::time::timeout(Duration::from_secs(1), refresh.notified())
+        .await
+        .expect("bridge notified after callback");
+    assert_eq!(directory.saved()["token"]["access_token"], "code-access");
+    assert_eq!(directory.saved()["token"]["refresh_token"], "code-refresh");
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/auth/status"))
+        .send()
+        .await
+        .expect("fetch connected status")
+        .json()
+        .await
+        .expect("read connected status");
+    assert_eq!(status["state"], "authorized");
+    assert!(!status.to_string().contains("code-access"));
+    assert!(!status.to_string().contains("code-refresh"));
+    let repeated = client.get(callback_url).send().await.expect("replay callback");
+    assert_eq!(repeated.headers()["location"], "/?auth=error");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), refresh.notified())
+            .await
+            .is_err(),
+        "a rejected callback must not cause an extra cloud poll"
+    );
+    let response = client
+        .post(format!("{base}/api/auth/start"))
+        .header("x-csrf-token", csrf)
+        .send()
+        .await
+        .expect("attempt second login");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = client
+        .post(format!("{base}/api/auth/revoke"))
+        .header("x-csrf-token", csrf)
+        .send()
+        .await
+        .expect("revoke via UI");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_cleared(&*connection.lock().await, &directory);
+    let requests = provider.finish();
+    assert_eq!(
+        requests.len(),
+        3,
+        "callback exchanges tokens but does not wait for device polling"
+    );
+    let form = requests[0].assert_client_form("/token");
+    assert_eq!(form["grant_type"], "authorization_code");
+    assert_eq!(form["code"], "web-code");
+    assert_eq!(form["redirect_uri"], redirect);
+    let verifier = PkceCodeVerifier::new(form["code_verifier"].clone());
+    assert_eq!(
+        PkceCodeChallenge::from_code_verifier_sha256(&verifier).as_str(),
+        authorization["code_challenge"]
+    );
+    for (request, token, hint) in [
+        (&requests[1], "code-access", "access_token"),
+        (&requests[2], "code-refresh", "refresh_token"),
+    ] {
+        let form = request.assert_client_form("/revoke");
+        assert_eq!(form["token"], token);
+        assert_eq!(form["token_type_hint"], hint);
+    }
+    task.abort();
+}
+
+#[tokio::test]
 async fn revoke_without_tokens_discards_pending_code_without_network_io() {
     let directory = TempDirectory::new();
     let server = MockServer::new(vec![]);
