@@ -136,6 +136,10 @@ impl MqttConnection {
                     }
                 }
                 Packet::Publish(publ) => {
+                    if publ.retain {
+                        log::warn!("Ignored retained MQTT command");
+                        return Ok(None);
+                    }
                     return Ok(Some(MqttData {
                         topic: from_mqtt_string(&publ.topic)?,
                         payload: from_mqtt_string(&publ.payload)?,
@@ -159,5 +163,42 @@ impl MqttConnection {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[tokio::test]
+    async fn accepts_live_commands_but_ignores_retained_replays() {
+        let mut mqtt = MqttConnection::new(MqttConfig {
+            server: "localhost".into(),
+            port: 1883,
+            client_id: "command-test".into(),
+            user: String::new(),
+            password: String::new(),
+            base_topic: "house/daikin".into(),
+        });
+        let topic = "house/daikin/cmnd/climate_mode";
+        for retained in [false, true] {
+            // MQTT 5 QoS 0 publish with an empty properties section.
+            let mut packet = vec![0x30 | u8::from(retained), (topic.len() + 6) as u8];
+            packet.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            packet.extend_from_slice(topic.as_bytes());
+            packet.push(0);
+            packet.extend_from_slice(b"off");
+            let event =
+                Event::Incoming(Packet::read(&mut BytesMut::from(packet.as_slice()), None).expect("publish packet"));
+            let message = mqtt.handle_mqtt_message(event).await.expect("MQTT handling");
+            if retained {
+                assert!(message.is_none());
+            } else {
+                let message = message.expect("live command");
+                assert_eq!(message.topic, topic);
+                assert_eq!(message.payload, "off");
+            }
+        }
     }
 }

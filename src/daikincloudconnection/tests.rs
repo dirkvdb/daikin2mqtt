@@ -16,6 +16,8 @@ const CLIENT_ID: &str = "test-client+id";
 const CLIENT_SECRET: &str = "test-secret&=+";
 const REDIRECT_URI: &str = "https://example.invalid/custom/oauth/callback";
 const DEVICES: &str = r#"[{"id":"test-gateway"}]"#;
+const MODE_PATH: &str =
+    "/v1/gateway-devices/test-gateway/management-points/climateControl/characteristics/operationMode";
 
 struct TempDirectory(PathBuf);
 
@@ -144,6 +146,21 @@ impl RecordedRequest {
         assert_eq!(form["client_id"], CLIENT_ID);
         assert_eq!(form["client_secret"], CLIENT_SECRET);
         form
+    }
+
+    fn assert_characteristic_patch(&self, access: &str, path: &str, body: serde_json::Value) {
+        assert_eq!(self.method, "PATCH");
+        assert_eq!(self.path, path);
+        assert_eq!(self.headers.get("authorization"), Some(&format!("Bearer {access}")));
+        assert_eq!(self.headers.get("accept").map(String::as_str), Some("application/json"));
+        assert_eq!(
+            self.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&self.body).expect("JSON PATCH body"),
+            body
+        );
     }
 
     fn assert_bearer_api(&self, access: &str) {
@@ -593,6 +610,621 @@ async fn unauthenticated_update_returns_the_cached_authorization_url() {
     assert_eq!(first, second);
     assert_eq!(first, connection.auth_url());
     assert_cleared(&connection, &directory);
+}
+
+#[tokio::test]
+async fn set_characteristic_patches_modes_and_accepts_empty_204() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![MockResponse::json(204, ""), MockResponse::json(204, "")]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    for (characteristic, value) in [("onOffMode", "on"), ("operationMode", "cooling")] {
+        connection
+            .set_characteristic("test-gateway", "climateControl", characteristic, None, &value.into())
+            .await
+            .expect("PATCH mode with empty response");
+    }
+    let requests = server.finish();
+    requests[0].assert_characteristic_patch(
+        "stored-access",
+        "/v1/gateway-devices/test-gateway/management-points/climateControl/characteristics/onOffMode",
+        serde_json::json!({"value": "on"}),
+    );
+    requests[1].assert_characteristic_patch("stored-access", MODE_PATH, serde_json::json!({"value": "cooling"}));
+}
+
+#[tokio::test]
+async fn boiler_mode_commands_patch_power_and_boost_characteristics() {
+    use crate::{commands, mqtt::MqttData};
+
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new((0..6).map(|_| MockResponse::json(204, "")).collect());
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let mut devices: serde_json::Value =
+        serde_json::from_str(include_str!("../../resources/test/managementpoints.json")).expect("device fixture");
+    let gateway = devices[0]["id"].as_str().expect("gateway ID").to_owned();
+    let mut expected = Vec::new();
+    for (mode, boost_active) in [("performance", false), ("heat_pump", true), ("off", true)] {
+        let boiler = devices[0]["managementPoints"]
+            .as_array_mut()
+            .expect("management points")
+            .iter_mut()
+            .find(|point| point["embeddedId"] == "domesticHotWaterTank")
+            .expect("boiler");
+        boiler["powerfulMode"]["value"] = serde_json::json!(if boost_active { "on" } else { "off" });
+        boiler["isPowerfulModeActive"]["value"] = serde_json::json!(boost_active);
+        let message = MqttData::new(commands::topic("home/daikin", commands::WATER_MODE), mode.into());
+        let updates = commands::updates("home/daikin", &message, &devices).expect("boiler mode command");
+        assert_eq!(updates.len(), 2);
+        for update in updates {
+            connection
+                .set_characteristic(
+                    &update.gateway_id,
+                    &update.management_point,
+                    update.characteristic,
+                    update.path.as_deref(),
+                    &update.value,
+                )
+                .await
+                .expect("send boiler command");
+        }
+        expected.extend(match mode {
+            "performance" => [("onOffMode", "on"), ("powerfulMode", "on")],
+            "heat_pump" => [("powerfulMode", "off"), ("onOffMode", "on")],
+            _ => [("powerfulMode", "off"), ("onOffMode", "off")],
+        });
+    }
+    for (request, (characteristic, value)) in server.finish().iter().zip(expected) {
+        request.assert_characteristic_patch(
+            "stored-access",
+            &format!(
+                "/v1/gateway-devices/{gateway}/management-points/domesticHotWaterTank/characteristics/{characteristic}"
+            ),
+            serde_json::json!({"value": value}),
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_command_hooks_patch_every_advertised_setting() {
+    use crate::{commands, hassdiscovery, mqtt::MqttData};
+
+    let base = "regression/house/daikin";
+    let mut devices: serde_json::Value = serde_json::from_str(include_str!("../../resources/test/managementpoints.json")).expect("device fixture");
+    let boiler = devices[0]["managementPoints"]
+        .as_array_mut()
+        .expect("management points")
+        .iter_mut()
+        .find(|point| point["embeddedId"] == "domesticHotWaterTank")
+        .expect("boiler");
+    let setpoint = &mut boiler["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]["domesticHotWaterTemperature"];
+    setpoint["settable"] = serde_json::json!(true);
+    setpoint["stepValue"] = serde_json::json!(0.5);
+
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let mut connection = connection(&directory);
+    for (water, management_point, command_prefix, temperature, temperature_path, min, max) in [
+        (
+            false,
+            "climateControlMainZone",
+            "climate",
+            21.5,
+            "/operationModes/heating/setpoints/roomTemperature",
+            12,
+            24,
+        ),
+        (
+            true,
+            "domesticHotWaterTank",
+            "domestic_hot_water",
+            48.5,
+            "/operationModes/heating/setpoints/domesticHotWaterTemperature",
+            30,
+            60,
+        ),
+    ] {
+        let data = if water {
+            hassdiscovery::domestic_hot_water_topic(base)
+        } else {
+            hassdiscovery::climate_control_topic(base)
+        }
+        .expect("construct discovery");
+        let data = hassdiscovery::with_device_capabilities(data, base, &devices, water).expect("apply device capabilities to discovery");
+        let discovery: serde_json::Value = serde_json::from_str(&data.payload).expect("discovery JSON");
+        assert_eq!(
+            discovery["modes"],
+            if water {
+                serde_json::json!(["off", "heat_pump", "performance"])
+            } else {
+                serde_json::json!(["off", "heat"])
+            }
+        );
+        assert_eq!(discovery["min_temp"], min);
+        assert_eq!(discovery["max_temp"], max);
+        if !water {
+            assert_eq!(discovery["temp_step"], 0.5);
+        }
+        for (field, suffix) in [
+            ("mode_command_topic", "mode"),
+            ("power_command_topic", "power"),
+            ("temperature_command_topic", "temperature"),
+        ] {
+            assert_eq!(discovery[field], format!("{base}/cmnd/{command_prefix}_{suffix}"));
+        }
+
+        let mut cases = Vec::new();
+        for mode in discovery["modes"].as_array().expect("advertised modes") {
+            let mode = mode.as_str().expect("mode string");
+            let patches = match (water, mode) {
+                (_, "off") => vec![("onOffMode", serde_json::json!({"value": "off"}))],
+                (false, "heat") | (true, "heat_pump") => {
+                    vec![("onOffMode", serde_json::json!({"value": "on"}))]
+                }
+                (true, "performance") => vec![
+                    ("onOffMode", serde_json::json!({"value": "on"})),
+                    ("powerfulMode", serde_json::json!({"value": "on"})),
+                ],
+                _ => panic!("unexpected advertised mode: {mode}"),
+            };
+            cases.push(("mode_command_topic", mode.to_owned(), patches));
+        }
+        for (field, power) in [("payload_on", "on"), ("payload_off", "off")] {
+            assert_eq!(discovery[field], power);
+            cases.push((
+                "power_command_topic",
+                discovery[field].as_str().expect("power payload").to_owned(),
+                vec![("onOffMode", serde_json::json!({"value": power}))],
+            ));
+        }
+        cases.push((
+            "temperature_command_topic",
+            temperature.to_string(),
+            vec![("temperatureControl", serde_json::json!({"path": temperature_path, "value": temperature}))],
+        ));
+        let server = MockServer::new(
+            cases
+                .iter()
+                .flat_map(|(_, _, patches)| patches.iter().map(|_| MockResponse::json(204, "")))
+                .collect(),
+        );
+        use_mock(&mut connection, &server);
+        for (field, payload, patches) in &cases {
+            let message = MqttData::new(discovery[*field].as_str().expect("advertised command topic").into(), payload.clone());
+            let updates = commands::updates(base, &message, &devices).expect("plan advertised command");
+            assert_eq!(updates.len(), patches.len(), "command: {message:?}");
+            for update in updates {
+                connection
+                    .set_characteristic(
+                        &update.gateway_id,
+                        &update.management_point,
+                        update.characteristic,
+                        update.path.as_deref(),
+                        &update.value,
+                    )
+                    .await
+                    .expect("PATCH advertised command");
+            }
+        }
+        let expected = cases.into_iter().flat_map(|(_, _, patches)| patches);
+        for (request, (characteristic, body)) in server.finish().iter().zip(expected) {
+            request.assert_characteristic_patch(
+                "stored-access",
+                &format!("/v1/gateway-devices/c6d05dff-db9b-4565-825b-000000000000/management-points/{management_point}/characteristics/{characteristic}"),
+                body,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_preserves_temperature_numbers_and_nested_json_pointers() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![MockResponse::json(204, ""), MockResponse::json(204, "")]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let cases = [
+        (
+            "climateControlMainZone",
+            "/operationModes/heating/setpoints/roomTemperature",
+            serde_json::json!(21.5),
+        ),
+        (
+            "domesticHotWaterTank",
+            "/operationModes/heating/setpoints/domesticHotWaterTemperature",
+            serde_json::json!(48),
+        ),
+    ];
+    for (management_point, path, value) in &cases {
+        connection
+            .set_characteristic(
+                "test-gateway",
+                management_point,
+                "temperatureControl",
+                Some(path),
+                value,
+            )
+            .await
+            .expect("PATCH nested numeric temperature");
+    }
+    for (request, (management_point, path, value)) in server.finish().iter().zip(cases) {
+        request.assert_characteristic_patch(
+            "stored-access",
+            &format!("/v1/gateway-devices/test-gateway/management-points/{management_point}/characteristics/temperatureControl"),
+            serde_json::json!({"path": path, "value": value}),
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_preserves_other_json_value_types() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let values = [
+        serde_json::json!(true),
+        serde_json::Value::Null,
+        serde_json::json!([1, "two"]),
+        serde_json::json!({"nested": 3}),
+    ];
+    let server = MockServer::new(values.iter().map(|_| MockResponse::json(204, "")).collect());
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    for value in &values {
+        connection
+            .set_characteristic("test-gateway", "climateControl", "operationMode", None, value)
+            .await
+            .expect("preserve typed JSON value");
+    }
+    for (request, value) in server.finish().iter().zip(values) {
+        request.assert_characteristic_patch("stored-access", MODE_PATH, serde_json::json!({"value": value}));
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_encodes_each_url_segment_without_changing_json_pointer() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![MockResponse::json(204, "")]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let path = "/operationModes/a~1b/setpoints/a~0b";
+    connection
+        .set_characteristic(
+            "gateway/ ?#%",
+            "mp/../é",
+            "name/%2F?#",
+            Some(path),
+            &serde_json::json!(21),
+        )
+        .await
+        .expect("encode dynamic endpoint segments");
+    server.finish()[0].assert_characteristic_patch(
+        "stored-access",
+        "/v1/gateway-devices/gateway%2F%20%3F%23%25/management-points/mp%2F..%2F%C3%A9/characteristics/name%2F%252F%3F%23",
+        serde_json::json!({"path": path, "value": 21}),
+    );
+}
+
+#[tokio::test]
+async fn set_characteristic_rejects_dot_only_endpoint_segments_without_network_io() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    for dot in [".", ".."] {
+        for (gateway, point, name) in [(dot, "mp", "name"), ("gateway", dot, "name"), ("gateway", "mp", dot)] {
+            assert!(matches!(
+                connection
+                    .set_characteristic(gateway, point, name, None, &serde_json::json!("on"))
+                    .await,
+                Err(MqttBridgeError::RuntimeError(_))
+            ));
+        }
+    }
+    server.finish();
+}
+
+#[tokio::test]
+async fn set_characteristic_refreshes_expired_or_nearly_expired_tokens_before_patch() {
+    for expires_at in [now().saturating_sub(60), now() + 20] {
+        let directory = TempDirectory::new();
+        directory.seed_token("old-access", Some("old-refresh"), expires_at);
+        let server = MockServer::new(vec![
+            MockResponse::token("fresh-access", Some("rotated-refresh")),
+            MockResponse::json(204, ""),
+        ]);
+        let mut connection = connection(&directory);
+        use_mock(&mut connection, &server);
+        connection
+            .set_characteristic(
+                "test-gateway",
+                "climateControl",
+                "operationMode",
+                None,
+                &serde_json::json!("cooling"),
+            )
+            .await
+            .expect("refresh before PATCH");
+        assert_eq!(directory.saved()["token"]["refresh_token"], "rotated-refresh");
+        let requests = server.finish();
+        assert_refresh(&requests[0], "old-refresh");
+        requests[1].assert_characteristic_patch("fresh-access", MODE_PATH, serde_json::json!({"value": "cooling"}));
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_retries_once_after_401_with_the_same_body() {
+    let directory = TempDirectory::new();
+    directory.seed_token("rejected-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![
+        MockResponse::unauthorized(),
+        MockResponse::token("accepted-access", Some("rotated-refresh")),
+        MockResponse::json(204, ""),
+    ]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let path = "/operationModes/heating/setpoints/roomTemperature";
+    connection
+        .set_characteristic(
+            "test-gateway",
+            "climateControl",
+            "temperatureControl",
+            Some(path),
+            &serde_json::json!(21.5),
+        )
+        .await
+        .expect("refresh after PATCH 401");
+    assert_eq!(directory.saved()["token"]["refresh_token"], "rotated-refresh");
+    let requests = server.finish();
+    for (index, access) in [(0, "rejected-access"), (2, "accepted-access")] {
+        requests[index].assert_characteristic_patch(
+            access,
+            "/v1/gateway-devices/test-gateway/management-points/climateControl/characteristics/temperatureControl",
+            serde_json::json!({"path": path, "value": 21.5}),
+        );
+    }
+    assert_refresh(&requests[1], "stored-refresh");
+}
+
+#[tokio::test]
+async fn set_characteristic_second_401_clears_authentication_and_stops_retrying() {
+    let directory = TempDirectory::new();
+    directory.seed_token("rejected-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![
+        MockResponse::unauthorized(),
+        MockResponse::token("also-rejected-access", Some("rotated-refresh")),
+        MockResponse::unauthorized(),
+    ]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let value = serde_json::json!("cooling");
+    let authorization = authorization_required(
+        connection
+            .set_characteristic("test-gateway", "climateControl", "operationMode", None, &value)
+            .await
+            .expect_err("second PATCH 401 needs authorization"),
+    );
+    assert_cleared(&connection, &directory);
+    assert_eq!(
+        authorization,
+        authorization_required(
+            connection
+                .set_characteristic("test-gateway", "climateControl", "operationMode", None, &value)
+                .await
+                .expect_err("no additional PATCH retry"),
+        )
+    );
+    let requests = server.finish();
+    requests[0].assert_characteristic_patch("rejected-access", MODE_PATH, serde_json::json!({"value": value}));
+    assert_refresh(&requests[1], "stored-refresh");
+    requests[2].assert_characteristic_patch("also-rejected-access", MODE_PATH, serde_json::json!({"value": value}));
+}
+
+#[tokio::test]
+async fn set_characteristic_refresh_failures_do_not_retry_the_patch() {
+    for invalid_grant in [false, true] {
+        let directory = TempDirectory::new();
+        directory.seed_token("rejected-access", Some("stored-refresh"), now() + 7200);
+        let server = MockServer::new(vec![
+            MockResponse::unauthorized(),
+            if invalid_grant {
+                MockResponse::invalid_grant()
+            } else {
+                MockResponse::unavailable()
+            },
+        ]);
+        let mut connection = connection(&directory);
+        use_mock(&mut connection, &server);
+        let saved_before = directory.saved();
+        let error = connection
+            .set_characteristic(
+                "test-gateway",
+                "climateControl",
+                "operationMode",
+                None,
+                &serde_json::json!("cooling"),
+            )
+            .await
+            .expect_err("refresh failed");
+        if invalid_grant {
+            authorization_required(error);
+            assert_cleared(&connection, &directory);
+        } else {
+            assert!(matches!(error, MqttBridgeError::NetworkError(_)));
+            assert_eq!(directory.saved(), saved_before);
+            assert!(connection.authentication_data.token.is_some());
+            assert!(connection.pending_authorization.is_none());
+        }
+        let requests = server.finish();
+        requests[0].assert_characteristic_patch("rejected-access", MODE_PATH, serde_json::json!({"value": "cooling"}));
+        assert_refresh(&requests[1], "stored-refresh");
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_without_refresh_token_clears_auth_on_expiry_or_401() {
+    for expires_at in [now().saturating_sub(60), now() + 7200] {
+        for refresh in [None, Some("")] {
+            let directory = TempDirectory::new();
+            directory.seed_token("rejected-access", refresh, expires_at);
+            let server = MockServer::new(if expires_at > now() {
+                vec![MockResponse::unauthorized()]
+            } else {
+                vec![]
+            });
+            let mut connection = connection(&directory);
+            use_mock(&mut connection, &server);
+            authorization_required(
+                connection
+                    .set_characteristic(
+                        "test-gateway",
+                        "climateControl",
+                        "operationMode",
+                        None,
+                        &serde_json::json!("cooling"),
+                    )
+                    .await
+                    .expect_err("no usable refresh token"),
+            );
+            assert_cleared(&connection, &directory);
+            server.finish();
+        }
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_api_failures_report_status_without_secrets_or_retry() {
+    for status in [400, 403, 404, 429, 500, 503, 302] {
+        let directory = TempDirectory::new();
+        directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+        let server = MockServer::new(vec![MockResponse::json(status, CLIENT_SECRET)]);
+        let mut connection = connection(&directory);
+        use_mock(&mut connection, &server);
+        let saved_before = directory.saved();
+        let error = connection
+            .set_characteristic(
+                "test-gateway",
+                "climateControl",
+                "operationMode",
+                None,
+                &serde_json::json!("cooling"),
+            )
+            .await
+            .expect_err("unsuccessful PATCH status");
+        assert!(matches!(error, MqttBridgeError::NetworkError(_)));
+        let message = error.to_string();
+        assert!(message.contains("Characteristic update failed"));
+        assert!(message.contains(&status.to_string()));
+        for secret in [CLIENT_SECRET, "stored-access", "stored-refresh"] {
+            assert!(!message.contains(secret));
+        }
+        assert_eq!(directory.saved(), saved_before);
+        server.finish()[0].assert_characteristic_patch(
+            "stored-access",
+            MODE_PATH,
+            serde_json::json!({"value": "cooling"}),
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_characteristic_without_auth_returns_cached_authorization_without_network_io() {
+    let directory = TempDirectory::new();
+    let server = MockServer::new(vec![]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let expected = connection.auth_url();
+    for _ in 0..2 {
+        let authorization = authorization_required(
+            connection
+                .set_characteristic(
+                    "test-gateway",
+                    "climateControl",
+                    "operationMode",
+                    None,
+                    &serde_json::json!("cooling"),
+                )
+                .await
+                .expect_err("authorization needed before PATCH"),
+        );
+        assert_eq!(authorization, expected);
+        assert_cleared(&connection, &directory);
+    }
+    server.finish();
+}
+
+#[tokio::test]
+async fn set_characteristic_exchanges_pending_authorization_code_before_patch() {
+    let directory = TempDirectory::new();
+    let server = MockServer::new(vec![
+        MockResponse::token("code-access", Some("code-refresh")),
+        MockResponse::json(204, ""),
+    ]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let authorization = query(&connection.auth_url());
+    connection
+        .set_authorization_code(callback(
+            REDIRECT_URI,
+            &[("code", "test-code"), ("state", &authorization["state"])],
+        ))
+        .expect("accept callback");
+    connection
+        .set_characteristic(
+            "test-gateway",
+            "climateControl",
+            "operationMode",
+            None,
+            &serde_json::json!("cooling"),
+        )
+        .await
+        .expect("complete authorization before PATCH");
+    assert!(connection.pending_code.is_none());
+    assert_eq!(directory.saved()["token"]["access_token"], "code-access");
+    let requests = server.finish();
+    let form = requests[0].assert_client_form("/token");
+    assert_eq!(form["grant_type"], "authorization_code");
+    assert_eq!(form["code"], "test-code");
+    requests[1].assert_characteristic_patch("code-access", MODE_PATH, serde_json::json!({"value": "cooling"}));
+}
+
+#[tokio::test]
+async fn set_characteristic_blocks_pending_revocation_before_refresh_even_after_restart() {
+    for expires_at in [now().saturating_sub(60), now() + 7200] {
+        let directory = TempDirectory::new();
+        directory.seed_token("stored-access", Some("stored-refresh"), expires_at);
+        let server = MockServer::new(vec![MockResponse::unavailable(), MockResponse::success()]);
+        let mut connection = connection(&directory);
+        use_mock(&mut connection, &server);
+        let expected_token = directory.saved()["token"].clone();
+        connection
+            .revoke_authorization()
+            .await
+            .expect_err("leave revocation pending");
+        for _ in 0..2 {
+            let error = connection
+                .set_characteristic(
+                    "test-gateway",
+                    "climateControl",
+                    "operationMode",
+                    None,
+                    &serde_json::json!("cooling"),
+                )
+                .await
+                .expect_err("block PATCH and refresh during revocation");
+            assert!(matches!(error, MqttBridgeError::RuntimeError(_)));
+            assert!(error.to_string().contains("Revocation pending"));
+            assert_revocation_pending(&connection, &directory, &expected_token);
+            connection = self::connection(&directory);
+            use_mock(&mut connection, &server);
+        }
+        assert_revocations(&server.finish());
+    }
 }
 
 #[tokio::test]

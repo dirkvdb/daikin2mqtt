@@ -233,7 +233,7 @@ impl DaikinCloudConnection {
         Ok(())
     }
 
-    pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
+    async fn prepare_authentication(&mut self) -> Result<(), MqttBridgeError> {
         if self.deletion_pending {
             self.remove_authentication_file()?;
         }
@@ -256,6 +256,11 @@ impl DaikinCloudConnection {
         {
             self.refresh_access_token().await?;
         }
+        Ok(())
+    }
+
+    pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
+        self.prepare_authentication().await?;
         let response = self.gateway_devices().await?;
         let response = if response.status() == StatusCode::UNAUTHORIZED {
             self.refresh_access_token().await?;
@@ -276,6 +281,80 @@ impl DaikinCloudConnection {
             .text()
             .await
             .map_err(|_| MqttBridgeError::NetworkError("Failed to read gateway devices".into()))
+    }
+
+    pub(crate) async fn set_characteristic(
+        &mut self,
+        gateway_id: &str,
+        management_point: &str,
+        characteristic: &str,
+        path: Option<&str>,
+        value: &serde_json::Value,
+    ) -> Result<(), MqttBridgeError> {
+        self.prepare_authentication().await?;
+        // URL path builders normalize dot-only segments instead of encoding them.
+        if [gateway_id, management_point, characteristic]
+            .iter()
+            .any(|segment| matches!(*segment, "." | ".."))
+        {
+            return Err(MqttBridgeError::RuntimeError(
+                "Characteristic endpoint must not contain dot-only path segments".into(),
+            ));
+        }
+        let mut url =
+            Url::parse(&self.api).map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?;
+        url.path_segments_mut()
+            .map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?
+            .pop_if_empty()
+            .extend([
+                "gateway-devices",
+                gateway_id,
+                "management-points",
+                management_point,
+                "characteristics",
+                characteristic,
+            ]);
+        let mut body = serde_json::json!({ "value": value });
+        if let Some(path) = path {
+            body["path"] = path.into();
+        }
+        let response = self.patch_characteristic(&url, &body).await?;
+        let response = if response.status() == StatusCode::UNAUTHORIZED {
+            self.refresh_access_token().await?;
+            self.patch_characteristic(&url, &body).await?
+        } else {
+            response
+        };
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(self.authorization_required()?);
+        }
+        if !response.status().is_success() {
+            return Err(MqttBridgeError::NetworkError(format!(
+                "Characteristic update failed: {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn patch_characteristic(
+        &self,
+        url: &Url,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, MqttBridgeError> {
+        let token = self
+            .authentication_data
+            .token
+            .as_ref()
+            .ok_or(MqttBridgeError::NotAuhrorized)?;
+        self.http_client
+            .patch(url.clone())
+            .header("Accept", "application/json")
+            .bearer_auth(&token.access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| MqttBridgeError::NetworkError("Characteristic update request failed".into()))
     }
 
     async fn refresh_access_token(&mut self) -> Result<(), MqttBridgeError> {

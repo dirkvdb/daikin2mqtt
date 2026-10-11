@@ -43,10 +43,92 @@ The entities use these topics, where `<base>` is configured with
 | Climate state | `<base>/climate_control` |
 | Water-heater state | `<base>/domestic_hot_water` |
 | Availability (both entities) | `<base>/state` |
+| Climate mode command | `<base>/cmnd/climate_mode` |
+| Climate power command | `<base>/cmnd/climate_power` |
+| Climate temperature command | `<base>/cmnd/climate_temperature` |
+| Water-heater mode command | `<base>/cmnd/domestic_hot_water_mode` |
+| Water-heater power command | `<base>/cmnd/domestic_hot_water_power` |
+| Water-heater temperature command | `<base>/cmnd/domestic_hot_water_temperature` |
 
 The climate entity reports `off`, `heat`, or `auto`: the Daikin operation modes
 `heating` and `auto` map to `heat` and `auto`, while an off power state takes
 precedence. Unrecognized operation modes are reported as unknown.
+
+## Commands
+
+Command coverage follows the [MQTT water-heater specification](https://www.home-assistant.io/integrations/water_heater.mqtt/)
+and [MQTT climate specification](https://www.home-assistant.io/integrations/climate.mqtt/):
+
+| Home Assistant action | Climate | Water heater |
+| --- | --- | --- |
+| Set mode | `climate.set_hvac_mode` | `water_heater.set_operation_mode` |
+| Turn on/off | `climate.turn_on` / `climate.turn_off` | `water_heater.turn_on` / `water_heater.turn_off` |
+| Set target temperature (when writable) | `climate.set_temperature` | `water_heater.set_temperature` |
+
+The water-heater specification has no additional command topic types. Climate
+fan, swing, humidity, and separate high/low temperature controls are not exposed
+because the supplied Daikin device data does not support them. Holiday dates,
+schedules, and leaving-water offsets are not mapped to these entities; they
+would need separately defined controls rather than invented climate presets.
+
+Both discovered entities support mode, power, and writable target-temperature
+commands. Home Assistant publishes commands at QoS 1 without retention. The
+bridge handles climate modes `off`, `heat`, and `auto`, and boiler/water-heater
+modes `off`, `heat_pump`, and `performance`. Discovery advertises only modes whose
+required writes pass validation against the latest cloud snapshot. For example,
+a heating-only device exposes `off` and `heat`, not an unusable `auto` option.
+`off` switches power off. Other modes set the Daikin operation mode if needed,
+then switch power on. Fixed-mode devices can still be enabled without attempting
+to change their read-only operation mode.
+
+The boiler's `performance` mode enables Daikin powerful/boost mode by writing
+`powerfulMode: on` after enabling tank power. Selecting `heat_pump` or `off`
+cancels requested or active boost with `powerfulMode: off` before changing power.
+All required writes are validated before any are sent. Devices without writable
+boost support reject `performance`; normal heating remains available when boost
+is not active.
+
+The reported water-heater mode is `off` when tank power is off, `performance`
+when `isPowerfulModeActive` is true, and otherwise `heat_pump` for Daikin's
+`heating` operation mode. This uses the existing MQTT `powerfull_mode` attribute
+(the spelling is retained for compatibility) and reports actual cloud state,
+not an optimistic boost selection.
+
+Both entities advertise `power_command_topic`, with `payload_on: on` and
+`payload_off: off`, when the device accepts both power states. Home Assistant's
+`climate.turn_on` and `climate.turn_off` actions publish to
+`<base>/cmnd/climate_power`; `water_heater.turn_on` and `water_heater.turn_off`
+publish to `<base>/cmnd/domestic_hot_water_power`. Power commands only change
+`onOffMode`; they preserve the operation mode and do not enable or cancel
+powerful/boost mode. Actual state is reported through the existing
+`mode_state_topic`, without optimistic updates. No `power_command_template` is
+needed because the configured payloads already match Daikin's values.
+
+Temperature payloads are numbers in degrees Celsius. Climate commands update
+`/operationModes/heating/setpoints/roomTemperature`; water-heater commands update
+`/operationModes/heating/setpoints/domesticHotWaterTemperature` within the
+`temperatureControl` characteristic. Fractional temperatures are preserved.
+Discovery uses the device's reported temperature bounds and climate step size.
+A temperature command topic is advertised only when both `temperatureControl`
+and its nested setpoint are writable. Read-only target and current temperatures
+remain visible, but Home Assistant does not offer a control that the device would
+reject. Similarly, mode and power command topics are omitted when their writes
+cannot be validated or the command target is missing or ambiguous.
+
+Commands require a successful cloud poll to identify the gateway and management
+point. The bridge validates writable flags, supported values, temperature bounds,
+and step sizes before sending authenticated PATCH requests to Daikin. Unsupported
+modes and read-only setpoints are rejected and logged, not forced. This means a
+boiler setpoint marked read-only by Daikin cannot be changed by the bridge.
+Commands are rejected if multiple gateways expose the same entity, rather than
+sending them to an arbitrary device. Authentication remains web-UI-only.
+
+After a command attempt, the bridge requests fresh cloud state; it does not
+optimistically report success. Daikin may take time to reflect changes, so the
+normal polling cycle also continues. Failed commands are logged and are not
+queued for later replay. Retained incoming commands are ignored; do not retain
+commands in manual MQTT publishers either, since brokers can deliver a live
+retained publication without marking it as retained to existing subscribers.
 
 Discovery configuration is published with retain enabled on every successful
 status update. Home Assistant can discover the entity after connecting, and a

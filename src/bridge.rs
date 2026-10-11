@@ -1,3 +1,4 @@
+use crate::commands;
 use crate::daikincloudconnection::DaikinCloudConnection;
 use crate::hassdiscovery;
 use crate::mqtt::{MqttConfig, MqttConnection, MqttData};
@@ -25,7 +26,7 @@ struct ClimateControl {
     outdoor_temperature: i8,
     room_temperature: f32,
     heating_setpoint_leaving_water_offset: i8,
-    heating_setpoint_room_temperature: i8,
+    heating_setpoint_room_temperature: f32,
 }
 
 #[derive(Default, Serialize)]
@@ -35,7 +36,7 @@ struct DomesticHotWaterTank {
     on_off_mode: String,
     operation_mode: String,
     water_temperature: i8,
-    water_setpoint: i8,
+    water_setpoint: f32,
     powerfull_mode: bool,
 }
 
@@ -71,6 +72,7 @@ pub struct DaikinMqttBridge {
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
     status: MqttStatus,
+    devices: Value,
 }
 
 impl DaikinMqttBridge {
@@ -85,6 +87,7 @@ impl DaikinMqttBridge {
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
             status: MqttStatus::default(),
+            devices: Value::Null,
         }
     }
 
@@ -128,8 +131,9 @@ impl DaikinMqttBridge {
             tokio::select! {
                 mqtt_msg = self.mqtt.poll() => {
                     if let Ok(Some(msg)) = mqtt_msg {
-                        // Authentication commands are deliberately no longer accepted over MQTT.
-                        log::warn!("Ignored MQTT command: {}", msg.topic);
+                        if let Err(err) = self.handle_command(&connection, &refresh, &msg).await {
+                            log::warn!("MQTT command {} failed: {err}", msg.topic);
+                        }
                     }
                 }
                 _ = interval.tick() => {
@@ -146,6 +150,33 @@ impl DaikinMqttBridge {
         }
     }
 
+    async fn handle_command(
+        &mut self,
+        connection: &Mutex<DaikinCloudConnection>,
+        refresh: &Notify,
+        message: &MqttData,
+    ) -> Result<(), MqttBridgeError> {
+        let updates = commands::updates(self.mqtt.base_topic(), message, &self.devices)?;
+        let mut cloud = connection.lock().await;
+        for update in updates {
+            let result = cloud
+                .set_characteristic(
+                    &update.gateway_id,
+                    &update.management_point,
+                    update.characteristic,
+                    update.path.as_deref(),
+                    &update.value,
+                )
+                .await;
+            // Re-read actual state even if a multi-write mode command partly fails.
+            // Never optimistically publish an unconfirmed device setting.
+            refresh.notify_one();
+            result?;
+        }
+        log::info!("Sent MQTT command: {}", message.topic);
+        Ok(())
+    }
+
     async fn poll_cloud(&mut self, connection: &Mutex<DaikinCloudConnection>) -> Result<(), MqttBridgeError> {
         // Release the cloud lock before publishing, which may wait for the MQTT broker.
         let result = connection.lock().await.update().await;
@@ -153,6 +184,7 @@ impl DaikinMqttBridge {
             Ok(status_json) => {
                 self.update_online_status(true).await?;
                 self.status.online = true;
+                self.devices = serde_json::from_str(&status_json)?;
                 match DaikinMqttBridge::process_status_json(status_json) {
                     Ok(status) => {
                         self.update_heatpump_status(status).await?;
@@ -191,8 +223,18 @@ impl DaikinMqttBridge {
     async fn update_heatpump_status(&mut self, status: DaikinStatus) -> Result<(), MqttBridgeError> {
         if self.hass_discovery {
             // Republish with status so discovery also recovers after a broker restart.
-            let climate = hassdiscovery::climate_control_topic(self.mqtt.base_topic())?;
-            let water_heater = hassdiscovery::domestic_hot_water_topic(self.mqtt.base_topic())?;
+            let climate = hassdiscovery::with_device_capabilities(
+                hassdiscovery::climate_control_topic(self.mqtt.base_topic())?,
+                self.mqtt.base_topic(),
+                &self.devices,
+                false,
+            )?;
+            let water_heater = hassdiscovery::with_device_capabilities(
+                hassdiscovery::domestic_hot_water_topic(self.mqtt.base_topic())?,
+                self.mqtt.base_topic(),
+                &self.devices,
+                true,
+            )?;
             self.mqtt.publish(climate, true).await?;
             self.mqtt.publish(water_heater, true).await?;
         }
@@ -251,7 +293,7 @@ impl DaikinMqttBridge {
                                 &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
                                     ["leavingWaterOffset"]["value"],
                             )?;
-                            status.climate_control.heating_setpoint_room_temperature = parse_i8(
+                            status.climate_control.heating_setpoint_room_temperature = parse_f32(
                                 &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
                                     ["roomTemperature"]["value"],
                             )?;
@@ -266,7 +308,7 @@ impl DaikinMqttBridge {
                             status.domestic_hot_water_tank.operation_mode = parse_str(&mp["operationMode"]["value"])?;
                             status.domestic_hot_water_tank.water_temperature =
                                 parse_i8(&mp["sensoryData"]["value"]["tankTemperature"]["value"])?;
-                            status.domestic_hot_water_tank.water_setpoint = parse_i8(
+                            status.domestic_hot_water_tank.water_setpoint = parse_f32(
                                 &mp["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
                                     ["domesticHotWaterTemperature"]["value"],
                             )?;
@@ -345,9 +387,23 @@ mod tests {
                 poll_interval: time::Duration::from_secs(600),
                 data_dir: PathBuf::new(),
             });
+            bridge.devices =
+                serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
             let discovery = [
-                hassdiscovery::climate_control_topic("test/daikin").expect("climate discovery data"),
-                hassdiscovery::domestic_hot_water_topic("test/daikin").expect("water heater discovery data"),
+                hassdiscovery::with_device_capabilities(
+                    hassdiscovery::climate_control_topic("test/daikin").expect("climate discovery data"),
+                    "test/daikin",
+                    &bridge.devices,
+                    false,
+                )
+                .expect("climate capabilities"),
+                hassdiscovery::with_device_capabilities(
+                    hassdiscovery::domestic_hot_water_topic("test/daikin").expect("water heater discovery data"),
+                    "test/daikin",
+                    &bridge.devices,
+                    true,
+                )
+                .expect("water heater capabilities"),
             ];
             let mut expected_topics = Vec::new();
             for _ in 0..2 {
@@ -422,17 +478,35 @@ mod tests {
         assert_eq!(daikin_status.climate_control.outdoor_temperature, 14);
         assert_eq!(daikin_status.climate_control.room_temperature, 21.0);
         assert_eq!(daikin_status.climate_control.heating_setpoint_leaving_water_offset, 5);
-        assert_eq!(daikin_status.climate_control.heating_setpoint_room_temperature, 19);
+        assert_eq!(daikin_status.climate_control.heating_setpoint_room_temperature, 19.0);
         assert_eq!(daikin_status.climate_control.is_in_error_state, false);
         assert_eq!(daikin_status.climate_control.is_in_warning_state, false);
 
         assert_eq!(daikin_status.domestic_hot_water_tank.on_off_mode, "on");
         assert_eq!(daikin_status.domestic_hot_water_tank.operation_mode, "heating");
         assert_eq!(daikin_status.domestic_hot_water_tank.water_temperature, 54);
-        assert_eq!(daikin_status.domestic_hot_water_tank.water_setpoint, 45);
+        assert_eq!(daikin_status.domestic_hot_water_tank.water_setpoint, 45.0);
         assert_eq!(daikin_status.domestic_hot_water_tank.powerfull_mode, false);
         assert_eq!(daikin_status.domestic_hot_water_tank.is_in_error_state, false);
         assert_eq!(daikin_status.domestic_hot_water_tank.is_in_warning_state, false);
+    }
+
+    #[test_log::test]
+    fn fractional_setpoints_survive_state_processing() {
+        let mut devices: Value =
+            serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
+        for point in devices[0]["managementPoints"].as_array_mut().expect("points") {
+            let (name, temperature) = match point["embeddedId"].as_str() {
+                Some("climateControlMainZone") => ("roomTemperature", 20.5),
+                Some("domesticHotWaterTank") => ("domesticHotWaterTemperature", 48.5),
+                _ => continue,
+            };
+            point["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"][name]["value"] =
+                serde_json::json!(temperature);
+        }
+        let status = DaikinMqttBridge::process_status_json(devices.to_string()).expect("process state");
+        assert_eq!(status.climate_control.heating_setpoint_room_temperature, 20.5);
+        assert_eq!(status.domestic_hot_water_tank.water_setpoint, 48.5);
     }
 
     #[test_log::test]

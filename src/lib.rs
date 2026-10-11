@@ -1,5 +1,6 @@
 #![warn(clippy::unwrap_used)]
 pub mod bridge;
+mod commands;
 mod daikincloudconnection;
 mod hassdiscovery;
 pub mod mqtt;
