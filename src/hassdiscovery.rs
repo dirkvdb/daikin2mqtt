@@ -4,7 +4,7 @@ use crate::{mqtt::MqttData, MqttBridgeError};
 
 const HASS_DISCOVERY_TOPIC: &str = "homeassistant";
 const MODE_STATE_TEMPLATE: &str =
-    "{{ 'off' if value_json.on_off_mode == 'off' else {'heating': 'heat'}.get(value_json.operation_mode, 'None') }}";
+    "{{ 'off' if value_json.on_off_mode == 'off' else {'heating': 'heat', 'auto': 'auto'}.get(value_json.operation_mode, 'None') }}";
 const WATER_HEATER_MODE_STATE_TEMPLATE: &str =
     "{{ 'off' if value_json.on_off_mode == 'off' else {'heating': 'heat_pump'}.get(value_json.operation_mode, 'None') }}";
 
@@ -79,7 +79,7 @@ pub fn climate_control_topic(base_topic: &str) -> Result<MqttData, MqttBridgeErr
         availability_topic: format!("{base_topic}/state"),
         mode_state_topic: state_topic.clone(),
         mode_state_template: MODE_STATE_TEMPLATE,
-        modes: vec!["off", "heat"],
+        modes: vec!["off", "heat", "auto"],
         current_temperature_topic: state_topic.clone(),
         current_temperature_template: "{{ value_json.room_temperature }}",
         temperature_state_topic: state_topic.clone(),
@@ -149,7 +149,7 @@ mod tests {
             "{{ value_json.heating_setpoint_room_temperature }}"
         );
         assert_eq!(payload["mode_state_template"], MODE_STATE_TEMPLATE);
-        assert_eq!(payload["modes"], json!(["off", "heat"]));
+        assert_eq!(payload["modes"], json!(["off", "heat", "auto"]));
         assert_eq!(payload["temperature_unit"], "C");
         assert_eq!(payload["device"]["identifiers"], json!(["daikin_6461696b696e"]));
         assert_eq!(payload["device"]["manufacturer"], "Daikin");
@@ -161,6 +161,21 @@ mod tests {
         );
         let fields = payload.as_object().expect("discovery object");
         assert!(!fields.keys().any(|field| field.ends_with("_command_topic")));
+    }
+
+    #[test_log::test]
+    fn climate_discovery_maps_and_advertises_auto_mode() {
+        let data = climate_control_topic("daikin").expect("serialize climate discovery");
+        let payload: Value = serde_json::from_str(&data.payload).expect("valid discovery JSON");
+
+        assert_eq!(
+            payload["mode_state_template"],
+            "{{ 'off' if value_json.on_off_mode == 'off' else {'heating': 'heat', 'auto': 'auto'}.get(value_json.operation_mode, 'None') }}"
+        );
+        assert!(payload["modes"]
+            .as_array()
+            .expect("advertised HVAC modes")
+            .contains(&json!("auto")));
     }
 
     #[test_log::test]

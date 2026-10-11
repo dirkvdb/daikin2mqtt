@@ -44,6 +44,10 @@ The entities use these topics, where `<base>` is configured with
 | Water-heater state | `<base>/domestic_hot_water` |
 | Availability (both entities) | `<base>/state` |
 
+The climate entity reports `off`, `heat`, or `auto`: the Daikin operation modes
+`heating` and `auto` map to `heat` and `auto`, while an off power state takes
+precedence. Unrecognized operation modes are reported as unknown.
+
 Discovery configuration is published with retain enabled on every successful
 status update. Home Assistant can discover the entity after connecting, and a
 broker restart that loses retained messages is repaired by the next successful
