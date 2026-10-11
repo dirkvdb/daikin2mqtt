@@ -46,11 +46,7 @@ impl WebState {
             return Err(invalid_redirect());
         }
         let uri: axum::http::Uri = redirect.as_str().parse().map_err(|_| invalid_redirect())?;
-        let authority = uri
-            .authority()
-            .ok_or_else(invalid_redirect)?
-            .as_str()
-            .to_ascii_lowercase();
+        let authority = uri.authority().ok_or_else(invalid_redirect)?.as_str().to_ascii_lowercase();
         let mut allowed_hosts = vec![authority.clone(), listen.to_string()];
         if redirect.port().is_none() {
             if let Some(port) = redirect.port_or_known_default() {
@@ -66,10 +62,7 @@ impl WebState {
         }
         if matches!(listen.port(), 80 | 443) {
             let suffix = format!(":{}", listen.port());
-            let unqualified: Vec<_> = allowed_hosts
-                .iter()
-                .filter_map(|host| host.strip_suffix(&suffix).map(str::to_owned))
-                .collect();
+            let unqualified: Vec<_> = allowed_hosts.iter().filter_map(|host| host.strip_suffix(&suffix).map(str::to_owned)).collect();
             allowed_hosts.extend(unqualified);
         }
         Ok(Self {
@@ -93,12 +86,7 @@ pub(crate) fn router(state: WebState) -> Router {
         .route("/", get(|| async { Html(include_str!("../resources/web/index.html")) }))
         .route(
             "/style.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../resources/web/style.css"),
-                )
-            }),
+            get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../resources/web/style.css")) }),
         )
         .route(
             "/app.js",
@@ -121,26 +109,15 @@ pub(crate) fn router(state: WebState) -> Router {
 // The UI is a local administration endpoint, not a multi-user login system.
 // Host validation prevents DNS rebinding; a per-process secret blocks cross-site actions.
 async fn protect_requests(State(state): State<WebState>, request: Request, next: Next) -> Response {
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok());
-    let host_allowed = host.is_some_and(|host| {
-        state
-            .allowed_hosts
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(host))
-    });
+    let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok());
+    let host_allowed = host.is_some_and(|host| state.allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)));
     let mut response = if !host_allowed {
         message(
             StatusCode::FORBIDDEN,
             "Unrecognized web host; use the configured callback host or local listen address",
         )
     } else if request.method() == Method::POST && !valid_csrf(&state, &request) {
-        message(
-            StatusCode::FORBIDDEN,
-            "Invalid request origin or CSRF token; reload the page and try again",
-        )
+        message(StatusCode::FORBIDDEN, "Invalid request origin or CSRF token; reload the page and try again")
     } else {
         next.run(request).await
     };
@@ -156,11 +133,7 @@ async fn protect_requests(State(state): State<WebState>, request: Request, next:
 }
 
 fn valid_csrf(state: &WebState, request: &Request) -> bool {
-    let Some(token) = request
-        .headers()
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(token) = request.headers().get("x-csrf-token").and_then(|value| value.to_str().ok()) else {
         return false;
     };
     if CsrfToken::new(token.to_owned()) != state.csrf_token {
@@ -170,17 +143,13 @@ fn valid_csrf(state: &WebState, request: &Request) -> bool {
         let Some(origin) = origin.to_str().ok().and_then(|value| Url::parse(value).ok()) else {
             return false;
         };
-        let Some(host) = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-        else {
+        let Some(host) = request.headers().get(header::HOST).and_then(|value| value.to_str().ok()) else {
             return false;
         };
         // Both schemes are accepted for a TLS-terminating reverse proxy, but not other hosts.
-        let same_origin = ["http", "https"].iter().any(|scheme| {
-            Url::parse(&format!("{scheme}://{host}")).is_ok_and(|expected| origin.origin() == expected.origin())
-        });
+        let same_origin = ["http", "https"]
+            .iter()
+            .any(|scheme| Url::parse(&format!("{scheme}://{host}")).is_ok_and(|expected| origin.origin() == expected.origin()));
         if !same_origin {
             return false;
         }
@@ -241,19 +210,14 @@ async fn revoke(State(state): State<WebState>) -> Response {
     // On failure the bridge must also mark itself offline: revocation intent suspends polling.
     state.refresh.notify_one();
     match result {
-        Ok(()) => message(
-            StatusCode::OK,
-            "Daikin access has been revoked. You can connect again at any time.",
-        ),
+        Ok(()) => message(StatusCode::OK, "Daikin access has been revoked. You can connect again at any time."),
         Err(error) => message(StatusCode::BAD_GATEWAY, &safe_error(&error)),
     }
 }
 
 fn safe_error(error: &MqttBridgeError) -> String {
     match error {
-        MqttBridgeError::AuthorizationRequired(_) => {
-            "Authorization expired or was rejected; connect to Daikin again".into()
-        }
+        MqttBridgeError::AuthorizationRequired(_) => "Authorization expired or was rejected; connect to Daikin again".into(),
         _ => error.to_string(),
     }
 }
@@ -275,21 +239,11 @@ mod tests {
     impl Server {
         async fn new() -> Self {
             let directory = tempfile::tempdir().expect("create private data directory");
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind test UI");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test UI");
             let address = listener.local_addr().expect("get test address");
             let redirect = format!("http://{address}/oauth/callback");
-            let connection =
-                DaikinCloudConnection::new("client".into(), "secret".into(), redirect.clone(), directory.path())
-                    .expect("create connection");
-            let state = WebState::new(
-                Arc::new(Mutex::new(connection)),
-                Arc::new(Notify::new()),
-                redirect,
-                address,
-            )
-            .expect("create web state");
+            let connection = DaikinCloudConnection::new("client".into(), "secret".into(), redirect.clone(), directory.path()).expect("create connection");
+            let state = WebState::new(Arc::new(Mutex::new(connection)), Arc::new(Notify::new()), redirect, address).expect("create web state");
             let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.expect("serve test UI") });
             Self {
                 address,
@@ -408,11 +362,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("create client");
-        for query in [
-            "code=private-code&state=wrong",
-            "error=access_denied&error_description=private-error",
-            "",
-        ] {
+        for query in ["code=private-code&state=wrong", "error=access_denied&error_description=private-error", ""] {
             let response = client
                 .get(server.url(&format!("/oauth/callback?{query}")))
                 .send()
@@ -429,9 +379,7 @@ mod tests {
     fn normalizes_default_ports_for_local_hosts_and_proxy_origins() {
         let directory = tempfile::tempdir().expect("create directory");
         let redirect = "https://bridge.example.com/oauth/callback";
-        let connection =
-            DaikinCloudConnection::new("client".into(), "secret".into(), redirect.into(), directory.path())
-                .expect("create connection");
+        let connection = DaikinCloudConnection::new("client".into(), "secret".into(), redirect.into(), directory.path()).expect("create connection");
         let state = WebState::new(
             Arc::new(Mutex::new(connection)),
             Arc::new(Notify::new()),

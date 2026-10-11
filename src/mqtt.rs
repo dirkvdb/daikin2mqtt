@@ -57,13 +57,7 @@ impl MqttConnection {
         let mut mqttoptions = MqttOptions::new(cfg.client_id, cfg.server, cfg.port);
         mqttoptions.set_clean_start(true);
         mqttoptions.set_keep_alive(Duration::from_secs(180));
-        mqttoptions.set_last_will(LastWill::new(
-            state_topic(&cfg.base_topic),
-            OFFLINE_PAYLOAD,
-            QoS::AtLeastOnce,
-            true,
-            None,
-        ));
+        mqttoptions.set_last_will(LastWill::new(state_topic(&cfg.base_topic), OFFLINE_PAYLOAD, QoS::AtLeastOnce, true, None));
 
         if !cfg.user.is_empty() {
             mqttoptions.set_credentials(cfg.user, cfg.password);
@@ -92,10 +86,7 @@ impl MqttConnection {
     }
 
     pub async fn publish(&mut self, data: MqttData, retain: bool) -> Result<(), MqttBridgeError> {
-        Ok(self
-            .client
-            .publish(data.topic, QoS::AtLeastOnce, retain, data.payload)
-            .await?)
+        Ok(self.client.publish(data.topic, QoS::AtLeastOnce, retain, data.payload).await?)
     }
 
     async fn subscribe_to_commands(&mut self) -> Result<(), MqttBridgeError> {
@@ -189,8 +180,7 @@ mod tests {
             packet.extend_from_slice(topic.as_bytes());
             packet.push(0);
             packet.extend_from_slice(b"off");
-            let event =
-                Event::Incoming(Packet::read(&mut BytesMut::from(packet.as_slice()), None).expect("publish packet"));
+            let event = Event::Incoming(Packet::read(&mut BytesMut::from(packet.as_slice()), None).expect("publish packet"));
             let message = mqtt.handle_mqtt_message(event).await.expect("MQTT handling");
             if retained {
                 assert!(message.is_none());

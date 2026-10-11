@@ -16,18 +16,13 @@ const CLIENT_ID: &str = "test-client+id";
 const CLIENT_SECRET: &str = "test-secret&=+";
 const REDIRECT_URI: &str = "https://example.invalid/custom/oauth/callback";
 const DEVICES: &str = r#"[{"id":"test-gateway"}]"#;
-const MODE_PATH: &str =
-    "/v1/gateway-devices/test-gateway/management-points/climateControl/characteristics/operationMode";
+const MODE_PATH: &str = "/v1/gateway-devices/test-gateway/management-points/climateControl/characteristics/operationMode";
 
 struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "daikin2mqtt-auth-{}-{}",
-            std::process::id(),
-            CsrfToken::new_random().secret()
-        ));
+        let path = std::env::temp_dir().join(format!("daikin2mqtt-auth-{}-{}", std::process::id(), CsrfToken::new_random().secret()));
         fs::create_dir(&path).expect("create isolated authentication directory");
         Self(path)
     }
@@ -41,8 +36,7 @@ impl TempDirectory {
     }
 
     fn saved(&self) -> serde_json::Value {
-        serde_json::from_slice(&fs::read(self.authentication_file()).expect("read persisted authentication"))
-            .expect("authentication file is valid JSON")
+        serde_json::from_slice(&fs::read(self.authentication_file()).expect("read persisted authentication")).expect("authentication file is valid JSON")
     }
 
     fn seed_token(&self, access: &str, refresh: Option<&str>, expires_at: u64) {
@@ -74,10 +68,7 @@ struct MockResponse {
 
 impl MockResponse {
     fn json(status: u16, body: &str) -> Self {
-        Self {
-            status,
-            body: body.into(),
-        }
+        Self { status, body: body.into() }
     }
 
     fn devices() -> Self {
@@ -134,10 +125,7 @@ impl RecordedRequest {
     fn assert_client_form(&self, path: &str) -> BTreeMap<String, String> {
         assert_eq!(self.method, "POST");
         assert_eq!(self.path, path);
-        assert_eq!(
-            self.headers.get("content-type").map(String::as_str),
-            Some("application/x-www-form-urlencoded")
-        );
+        assert_eq!(self.headers.get("content-type").map(String::as_str), Some("application/x-www-form-urlencoded"));
         assert!(
             !self.headers.contains_key("authorization"),
             "client credentials must be in the form, not HTTP Basic auth"
@@ -153,14 +141,8 @@ impl RecordedRequest {
         assert_eq!(self.path, path);
         assert_eq!(self.headers.get("authorization"), Some(&format!("Bearer {access}")));
         assert_eq!(self.headers.get("accept").map(String::as_str), Some("application/json"));
-        assert_eq!(
-            self.headers.get("content-type").map(String::as_str),
-            Some("application/json")
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&self.body).expect("JSON PATCH body"),
-            body
-        );
+        assert_eq!(self.headers.get("content-type").map(String::as_str), Some("application/json"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&self.body).expect("JSON PATCH body"), body);
     }
 
     fn assert_bearer_api(&self, access: &str) {
@@ -184,10 +166,7 @@ impl MockServer {
         Self::new_with_observer(responses, |_| {})
     }
 
-    fn new_with_observer(
-        responses: Vec<MockResponse>,
-        mut observe: impl FnMut(&RecordedRequest) + Send + 'static,
-    ) -> Self {
+    fn new_with_observer(responses: Vec<MockResponse>, mut observe: impl FnMut(&RecordedRequest) + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
         let address = listener.local_addr().expect("mock server address");
         listener.set_nonblocking(true).expect("make mock listener nonblocking");
@@ -254,11 +233,7 @@ impl MockServer {
             .join()
             .expect("mock server must not panic")
             .expect("mock server IO succeeds");
-        assert_eq!(
-            requests.len(),
-            self.expected_requests,
-            "unexpected number of requests: {requests:?}"
-        );
+        assert_eq!(requests.len(), self.expected_requests, "unexpected number of requests: {requests:?}");
         requests
     }
 }
@@ -281,15 +256,11 @@ fn read_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
         }
         let count = stream.read(&mut buffer)?;
         if count == 0 || bytes.len() + count > 64 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "incomplete or oversized HTTP headers",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete or oversized HTTP headers"));
         }
         bytes.extend_from_slice(&buffer[..count]);
     };
-    let headers = std::str::from_utf8(&bytes[..headers_end])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let headers = std::str::from_utf8(&bytes[..headers_end]).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut lines = headers.split("\r\n");
     let mut request_line = lines.next().unwrap_or_default().split_whitespace();
     let method = request_line.next().unwrap_or_default().to_owned();
@@ -314,14 +285,8 @@ fn read_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
-    let body = String::from_utf8(bytes[headers_end..headers_end + length].to_vec())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(RecordedRequest {
-        method,
-        path,
-        headers,
-        body,
-    })
+    let body = String::from_utf8(bytes[headers_end..headers_end + length].to_vec()).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(RecordedRequest { method, path, headers, body })
 }
 
 fn connection(directory: &TempDirectory) -> DaikinCloudConnection {
@@ -329,13 +294,7 @@ fn connection(directory: &TempDirectory) -> DaikinCloudConnection {
 }
 
 fn connection_with_redirect(directory: &TempDirectory, redirect: &str) -> DaikinCloudConnection {
-    DaikinCloudConnection::new(
-        CLIENT_ID.into(),
-        CLIENT_SECRET.into(),
-        redirect.into(),
-        directory.path(),
-    )
-    .expect("construct test connection")
+    DaikinCloudConnection::new(CLIENT_ID.into(), CLIENT_SECRET.into(), redirect.into(), directory.path()).expect("construct test connection")
 }
 
 // Called by oauth_http under cfg(test), after oauth2's HTTPS endpoint validation.
@@ -400,23 +359,12 @@ fn assert_cleared(connection: &DaikinCloudConnection, directory: &TempDirectory)
     assert!(!directory.authentication_file().exists());
 }
 
-fn assert_revocation_pending(
-    connection: &DaikinCloudConnection,
-    directory: &TempDirectory,
-    expected_token: &serde_json::Value,
-) {
+fn assert_revocation_pending(connection: &DaikinCloudConnection, directory: &TempDirectory, expected_token: &serde_json::Value) {
     assert!(connection.authentication_data.revocation_pending);
     assert!(!connection.persistence_pending);
     assert!(!connection.deletion_pending);
-    let retained = connection
-        .authentication_data
-        .token
-        .as_ref()
-        .expect("retry token retained");
-    assert_eq!(
-        &serde_json::to_value(retained).expect("serialize retained token"),
-        expected_token
-    );
+    let retained = connection.authentication_data.token.as_ref().expect("retry token retained");
+    assert_eq!(&serde_json::to_value(retained).expect("serialize retained token"), expected_token);
     let saved = directory.saved();
     assert_eq!(&saved["token"], expected_token);
     assert_eq!(saved["revocation_pending"], true);
@@ -434,9 +382,7 @@ fn assert_revocations(requests: &[RecordedRequest]) {
     for request in requests {
         let form = request.assert_client_form("/revoke");
         assert_eq!(form.len(), 4);
-        assert!(revoked
-            .insert(form["token_type_hint"].clone(), form["token"].clone())
-            .is_none());
+        assert!(revoked.insert(form["token_type_hint"].clone(), form["token"].clone()).is_none());
     }
     assert_eq!(revoked["access_token"], "stored-access");
     assert_eq!(revoked["refresh_token"], "stored-refresh");
@@ -481,41 +427,23 @@ fn invalid_callbacks_do_not_consume_pending_authorization() {
     let mut invalid = vec![
         ("bare code", "valid-code".into()),
         ("malformed URL", "://not-a-url".into()),
-        (
-            "wrong state",
-            callback(REDIRECT_URI, &[("code", "valid-code"), ("state", "wrong")]),
-        ),
+        ("wrong state", callback(REDIRECT_URI, &[("code", "valid-code"), ("state", "wrong")])),
         ("missing state", callback(REDIRECT_URI, &[("code", "valid-code")])),
-        (
-            "empty state",
-            callback(REDIRECT_URI, &[("code", "valid-code"), ("state", "")]),
-        ),
+        ("empty state", callback(REDIRECT_URI, &[("code", "valid-code"), ("state", "")])),
         ("missing code", callback(REDIRECT_URI, &[("state", &state)])),
         ("empty code", callback(REDIRECT_URI, &[("code", ""), ("state", &state)])),
         (
             "duplicate state",
-            callback(
-                REDIRECT_URI,
-                &[("code", "valid-code"), ("state", &state), ("state", &state)],
-            ),
+            callback(REDIRECT_URI, &[("code", "valid-code"), ("state", &state), ("state", &state)]),
         ),
         (
             "duplicate code",
-            callback(
-                REDIRECT_URI,
-                &[("code", "valid-code"), ("code", "other-code"), ("state", &state)],
-            ),
+            callback(REDIRECT_URI, &[("code", "valid-code"), ("code", "other-code"), ("state", &state)]),
         ),
-        (
-            "provider error",
-            callback(REDIRECT_URI, &[("error", "access_denied"), ("state", &state)]),
-        ),
+        ("provider error", callback(REDIRECT_URI, &[("error", "access_denied"), ("state", &state)])),
         (
             "error with code",
-            callback(
-                REDIRECT_URI,
-                &[("code", "valid-code"), ("state", &state), ("error", "access_denied")],
-            ),
+            callback(REDIRECT_URI, &[("code", "valid-code"), ("state", &state), ("error", "access_denied")]),
         ),
         ("fragment", format!("{valid}#unexpected")),
     ];
@@ -527,32 +455,17 @@ fn invalid_callbacks_do_not_consume_pending_authorization() {
         "https://example.invalid/custom/oauth/callback/",
         "https://intruder@example.invalid/custom/oauth/callback",
     ] {
-        invalid.push((
-            "wrong redirect",
-            callback(redirect, &[("code", "valid-code"), ("state", &state)]),
-        ));
+        invalid.push(("wrong redirect", callback(redirect, &[("code", "valid-code"), ("state", &state)])));
     }
     for (case, url) in invalid {
         assert!(connection.set_authorization_code(url).is_err(), "accepted {case}");
         assert!(connection.pending_code.is_none(), "stored code after {case}");
-        assert!(
-            connection.pending_authorization.is_some(),
-            "consumed authorization after {case}"
-        );
-        assert_eq!(
-            connection.auth_url(),
-            authorization,
-            "changed authorization after {case}"
-        );
+        assert!(connection.pending_authorization.is_some(), "consumed authorization after {case}");
+        assert_eq!(connection.auth_url(), authorization, "changed authorization after {case}");
     }
-    connection
-        .set_authorization_code(valid)
-        .expect("valid callback remains usable");
+    connection.set_authorization_code(valid).expect("valid callback remains usable");
     assert!(connection.pending_authorization.is_none());
-    assert_eq!(
-        connection.pending_code.as_ref().expect("pending code").code,
-        "valid-code"
-    );
+    assert_eq!(connection.pending_code.as_ref().expect("pending code").code, "valid-code");
 }
 
 #[test]
@@ -567,38 +480,16 @@ fn callbacks_require_pending_authorization_and_cannot_be_replayed() {
     let authorization = connection.auth_url();
     let state = query(&authorization)["state"].clone();
     let callback = callback(REDIRECT_URI, &[("code", "accepted-code"), ("state", &state)]);
-    connection
-        .set_authorization_code(callback.clone())
-        .expect("accept callback once");
-    let verifier = connection
-        .pending_code
-        .as_ref()
-        .expect("pending code")
-        .verifier
-        .secret()
-        .clone();
+    connection.set_authorization_code(callback.clone()).expect("accept callback once");
+    let verifier = connection.pending_code.as_ref().expect("pending code").verifier.secret().clone();
     assert!(connection.set_authorization_code(callback.clone()).is_err());
-    assert_eq!(
-        connection.pending_code.as_ref().expect("code retained").code,
-        "accepted-code"
-    );
-    assert_eq!(
-        connection
-            .pending_code
-            .as_ref()
-            .expect("code retained")
-            .verifier
-            .secret(),
-        &verifier
-    );
+    assert_eq!(connection.pending_code.as_ref().expect("code retained").code, "accepted-code");
+    assert_eq!(connection.pending_code.as_ref().expect("code retained").verifier.secret(), &verifier);
     let next_authorization = connection.auth_url();
     assert_ne!(query(&next_authorization)["state"], state);
     assert!(connection.set_authorization_code(callback).is_err());
     assert_eq!(connection.auth_url(), next_authorization);
-    assert_eq!(
-        connection.pending_code.as_ref().expect("code retained").code,
-        "accepted-code"
-    );
+    assert_eq!(connection.pending_code.as_ref().expect("code retained").code, "accepted-code");
 }
 
 #[tokio::test]
@@ -643,8 +534,7 @@ async fn boiler_mode_commands_patch_power_and_boost_characteristics() {
     let server = MockServer::new((0..6).map(|_| MockResponse::json(204, "")).collect());
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
-    let mut devices: serde_json::Value =
-        serde_json::from_str(include_str!("../../resources/test/managementpoints.json")).expect("device fixture");
+    let mut devices: serde_json::Value = serde_json::from_str(include_str!("../../resources/test/managementpoints.json")).expect("device fixture");
     let gateway = devices[0]["id"].as_str().expect("gateway ID").to_owned();
     let mut expected = Vec::new();
     for (mode, boost_active) in [("performance", false), ("heat_pump", true), ("off", true)] {
@@ -680,9 +570,7 @@ async fn boiler_mode_commands_patch_power_and_boost_characteristics() {
     for (request, (characteristic, value)) in server.finish().iter().zip(expected) {
         request.assert_characteristic_patch(
             "stored-access",
-            &format!(
-                "/v1/gateway-devices/{gateway}/management-points/domesticHotWaterTank/characteristics/{characteristic}"
-            ),
+            &format!("/v1/gateway-devices/{gateway}/management-points/domesticHotWaterTank/characteristics/{characteristic}"),
             serde_json::json!({"value": value}),
         );
     }
@@ -841,13 +729,7 @@ async fn set_characteristic_preserves_temperature_numbers_and_nested_json_pointe
     ];
     for (management_point, path, value) in &cases {
         connection
-            .set_characteristic(
-                "test-gateway",
-                management_point,
-                "temperatureControl",
-                Some(path),
-                value,
-            )
+            .set_characteristic("test-gateway", management_point, "temperatureControl", Some(path), value)
             .await
             .expect("PATCH nested numeric temperature");
     }
@@ -893,13 +775,7 @@ async fn set_characteristic_encodes_each_url_segment_without_changing_json_point
     use_mock(&mut connection, &server);
     let path = "/operationModes/a~1b/setpoints/a~0b";
     connection
-        .set_characteristic(
-            "gateway/ ?#%",
-            "mp/../é",
-            "name/%2F?#",
-            Some(path),
-            &serde_json::json!(21),
-        )
+        .set_characteristic("gateway/ ?#%", "mp/../é", "name/%2F?#", Some(path), &serde_json::json!(21))
         .await
         .expect("encode dynamic endpoint segments");
     server.finish()[0].assert_characteristic_patch(
@@ -919,9 +795,7 @@ async fn set_characteristic_rejects_dot_only_endpoint_segments_without_network_i
     for dot in [".", ".."] {
         for (gateway, point, name) in [(dot, "mp", "name"), ("gateway", dot, "name"), ("gateway", "mp", dot)] {
             assert!(matches!(
-                connection
-                    .set_characteristic(gateway, point, name, None, &serde_json::json!("on"))
-                    .await,
+                connection.set_characteristic(gateway, point, name, None, &serde_json::json!("on")).await,
                 Err(MqttBridgeError::RuntimeError(_))
             ));
         }
@@ -934,20 +808,11 @@ async fn set_characteristic_refreshes_expired_or_nearly_expired_tokens_before_pa
     for expires_at in [now().saturating_sub(60), now() + 20] {
         let directory = TempDirectory::new();
         directory.seed_token("old-access", Some("old-refresh"), expires_at);
-        let server = MockServer::new(vec![
-            MockResponse::token("fresh-access", Some("rotated-refresh")),
-            MockResponse::json(204, ""),
-        ]);
+        let server = MockServer::new(vec![MockResponse::token("fresh-access", Some("rotated-refresh")), MockResponse::json(204, "")]);
         let mut connection = connection(&directory);
         use_mock(&mut connection, &server);
         connection
-            .set_characteristic(
-                "test-gateway",
-                "climateControl",
-                "operationMode",
-                None,
-                &serde_json::json!("cooling"),
-            )
+            .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
             .await
             .expect("refresh before PATCH");
         assert_eq!(directory.saved()["token"]["refresh_token"], "rotated-refresh");
@@ -970,13 +835,7 @@ async fn set_characteristic_retries_once_after_401_with_the_same_body() {
     use_mock(&mut connection, &server);
     let path = "/operationModes/heating/setpoints/roomTemperature";
     connection
-        .set_characteristic(
-            "test-gateway",
-            "climateControl",
-            "temperatureControl",
-            Some(path),
-            &serde_json::json!(21.5),
-        )
+        .set_characteristic("test-gateway", "climateControl", "temperatureControl", Some(path), &serde_json::json!(21.5))
         .await
         .expect("refresh after PATCH 401");
     assert_eq!(directory.saved()["token"]["refresh_token"], "rotated-refresh");
@@ -1042,13 +901,7 @@ async fn set_characteristic_refresh_failures_do_not_retry_the_patch() {
         use_mock(&mut connection, &server);
         let saved_before = directory.saved();
         let error = connection
-            .set_characteristic(
-                "test-gateway",
-                "climateControl",
-                "operationMode",
-                None,
-                &serde_json::json!("cooling"),
-            )
+            .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
             .await
             .expect_err("refresh failed");
         if invalid_grant {
@@ -1072,22 +925,12 @@ async fn set_characteristic_without_refresh_token_clears_auth_on_expiry_or_401()
         for refresh in [None, Some("")] {
             let directory = TempDirectory::new();
             directory.seed_token("rejected-access", refresh, expires_at);
-            let server = MockServer::new(if expires_at > now() {
-                vec![MockResponse::unauthorized()]
-            } else {
-                vec![]
-            });
+            let server = MockServer::new(if expires_at > now() { vec![MockResponse::unauthorized()] } else { vec![] });
             let mut connection = connection(&directory);
             use_mock(&mut connection, &server);
             authorization_required(
                 connection
-                    .set_characteristic(
-                        "test-gateway",
-                        "climateControl",
-                        "operationMode",
-                        None,
-                        &serde_json::json!("cooling"),
-                    )
+                    .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
                     .await
                     .expect_err("no usable refresh token"),
             );
@@ -1107,13 +950,7 @@ async fn set_characteristic_api_failures_report_status_without_secrets_or_retry(
         use_mock(&mut connection, &server);
         let saved_before = directory.saved();
         let error = connection
-            .set_characteristic(
-                "test-gateway",
-                "climateControl",
-                "operationMode",
-                None,
-                &serde_json::json!("cooling"),
-            )
+            .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
             .await
             .expect_err("unsuccessful PATCH status");
         assert!(matches!(error, MqttBridgeError::NetworkError(_)));
@@ -1124,11 +961,7 @@ async fn set_characteristic_api_failures_report_status_without_secrets_or_retry(
             assert!(!message.contains(secret));
         }
         assert_eq!(directory.saved(), saved_before);
-        server.finish()[0].assert_characteristic_patch(
-            "stored-access",
-            MODE_PATH,
-            serde_json::json!({"value": "cooling"}),
-        );
+        server.finish()[0].assert_characteristic_patch("stored-access", MODE_PATH, serde_json::json!({"value": "cooling"}));
     }
 }
 
@@ -1142,13 +975,7 @@ async fn set_characteristic_without_auth_returns_cached_authorization_without_ne
     for _ in 0..2 {
         let authorization = authorization_required(
             connection
-                .set_characteristic(
-                    "test-gateway",
-                    "climateControl",
-                    "operationMode",
-                    None,
-                    &serde_json::json!("cooling"),
-                )
+                .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
                 .await
                 .expect_err("authorization needed before PATCH"),
         );
@@ -1161,27 +988,15 @@ async fn set_characteristic_without_auth_returns_cached_authorization_without_ne
 #[tokio::test]
 async fn set_characteristic_exchanges_pending_authorization_code_before_patch() {
     let directory = TempDirectory::new();
-    let server = MockServer::new(vec![
-        MockResponse::token("code-access", Some("code-refresh")),
-        MockResponse::json(204, ""),
-    ]);
+    let server = MockServer::new(vec![MockResponse::token("code-access", Some("code-refresh")), MockResponse::json(204, "")]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
     let authorization = query(&connection.auth_url());
     connection
-        .set_authorization_code(callback(
-            REDIRECT_URI,
-            &[("code", "test-code"), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(REDIRECT_URI, &[("code", "test-code"), ("state", &authorization["state"])]))
         .expect("accept callback");
     connection
-        .set_characteristic(
-            "test-gateway",
-            "climateControl",
-            "operationMode",
-            None,
-            &serde_json::json!("cooling"),
-        )
+        .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
         .await
         .expect("complete authorization before PATCH");
     assert!(connection.pending_code.is_none());
@@ -1202,19 +1017,10 @@ async fn set_characteristic_blocks_pending_revocation_before_refresh_even_after_
         let mut connection = connection(&directory);
         use_mock(&mut connection, &server);
         let expected_token = directory.saved()["token"].clone();
-        connection
-            .revoke_authorization()
-            .await
-            .expect_err("leave revocation pending");
+        connection.revoke_authorization().await.expect_err("leave revocation pending");
         for _ in 0..2 {
             let error = connection
-                .set_characteristic(
-                    "test-gateway",
-                    "climateControl",
-                    "operationMode",
-                    None,
-                    &serde_json::json!("cooling"),
-                )
+                .set_characteristic("test-gateway", "climateControl", "operationMode", None, &serde_json::json!("cooling"))
                 .await
                 .expect_err("block PATCH and refresh during revocation");
             assert!(matches!(error, MqttBridgeError::RuntimeError(_)));
@@ -1232,10 +1038,7 @@ async fn code_exchange_uses_exact_redirect_body_credentials_pkce_and_bearer_api(
     let directory = TempDirectory::new();
     let server = MockServer::new(vec![
         // ONECTA's documented token response omits token_type.
-        MockResponse::json(
-            200,
-            r#"{"access_token":"code-access","refresh_token":"code-refresh","expires_in":3600}"#,
-        ),
+        MockResponse::json(200, r#"{"access_token":"code-access","refresh_token":"code-refresh","expires_in":3600}"#),
         MockResponse::devices(),
     ]);
     let redirect = "https://example.invalid:8443/custom%20oauth/callback/";
@@ -1245,16 +1048,10 @@ async fn code_exchange_uses_exact_redirect_body_credentials_pkce_and_bearer_api(
     assert_eq!(authorization["redirect_uri"], redirect);
     let code = "authorization+code/with &=?";
     connection
-        .set_authorization_code(callback(
-            redirect,
-            &[("code", code), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(redirect, &[("code", code), ("state", &authorization["state"])]))
         .expect("accept callback");
     let before = now();
-    assert_eq!(
-        connection.update().await.expect("exchange code and fetch devices"),
-        DEVICES
-    );
+    assert_eq!(connection.update().await.expect("exchange code and fetch devices"), DEVICES);
     let after = now();
     assert!(connection.pending_code.is_none());
     assert!(connection.pending_authorization.is_none());
@@ -1292,38 +1089,15 @@ async fn transient_code_exchange_failure_retains_code_and_pkce_for_retry() {
     use_mock(&mut connection, &server);
     let authorization = query(&connection.auth_url());
     connection
-        .set_authorization_code(callback(
-            REDIRECT_URI,
-            &[("code", "retry-code"), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(REDIRECT_URI, &[("code", "retry-code"), ("state", &authorization["state"])]))
         .expect("accept callback");
-    let verifier = connection
-        .pending_code
-        .as_ref()
-        .expect("pending code")
-        .verifier
-        .secret()
-        .clone();
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::NetworkError(_))
-    ));
+    let verifier = connection.pending_code.as_ref().expect("pending code").verifier.secret().clone();
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::NetworkError(_))));
     assert!(connection.authentication_data.token.is_none());
     assert!(connection.pending_authorization.is_none());
     assert!(!directory.authentication_file().exists());
-    assert_eq!(
-        connection.pending_code.as_ref().expect("code retained").code,
-        "retry-code"
-    );
-    assert_eq!(
-        connection
-            .pending_code
-            .as_ref()
-            .expect("verifier retained")
-            .verifier
-            .secret(),
-        &verifier
-    );
+    assert_eq!(connection.pending_code.as_ref().expect("code retained").code, "retry-code");
+    assert_eq!(connection.pending_code.as_ref().expect("verifier retained").verifier.secret(), &verifier);
     assert_eq!(connection.update().await.expect("retry code exchange"), DEVICES);
     assert!(connection.pending_code.is_none());
     let requests = server.finish();
@@ -1343,17 +1117,9 @@ async fn invalid_grant_during_code_exchange_requires_a_new_authorization() {
     use_mock(&mut connection, &server);
     let authorization = query(&connection.auth_url());
     connection
-        .set_authorization_code(callback(
-            REDIRECT_URI,
-            &[("code", "expired-code"), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(REDIRECT_URI, &[("code", "expired-code"), ("state", &authorization["state"])]))
         .expect("accept callback");
-    let next = authorization_required(
-        connection
-            .update()
-            .await
-            .expect_err("expired code needs reauthorization"),
-    );
+    let next = authorization_required(connection.update().await.expect_err("expired code needs reauthorization"));
     assert_ne!(query(&next)["state"], authorization["state"]);
     assert_ne!(query(&next)["code_challenge"], authorization["code_challenge"]);
     assert_eq!(next, connection.auth_url());
@@ -1405,19 +1171,10 @@ async fn refresh_response_without_rotation_retains_the_existing_refresh_token() 
     ]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
-    assert_eq!(
-        connection.update().await.expect("refresh without token rotation"),
-        DEVICES
-    );
+    assert_eq!(connection.update().await.expect("refresh without token rotation"), DEVICES);
     assert_eq!(directory.saved()["token"]["refresh_token"], "reusable-refresh");
     assert_eq!(
-        connection
-            .authentication_data
-            .token
-            .as_ref()
-            .expect("refreshed token")
-            .refresh_token
-            .as_deref(),
+        connection.authentication_data.token.as_ref().expect("refreshed token").refresh_token.as_deref(),
         Some("reusable-refresh")
     );
     let requests = server.finish();
@@ -1449,32 +1206,16 @@ async fn legacy_absolute_expires_in_is_migrated_and_saved_auth_code_is_removed()
     use_mock(&mut first, &server);
     assert!(first.pending_code.is_none());
     assert!(first.pending_authorization.is_none());
-    assert_eq!(
-        first
-            .authentication_data
-            .token
-            .as_ref()
-            .expect("legacy token")
-            .expires_at,
-        expires_at
-    );
+    assert_eq!(first.authentication_data.token.as_ref().expect("legacy token").expires_at, expires_at);
     let migrated = directory.saved();
     assert_eq!(migrated["token"]["expires_at"], expires_at);
     assert!(migrated["token"].get("expires_in").is_none());
     assert!(migrated.get("auth_code").is_none());
-    assert_eq!(
-        first.update().await.expect("legacy access token remains valid"),
-        DEVICES
-    );
+    assert_eq!(first.update().await.expect("legacy access token remains valid"), DEVICES);
     drop(first);
     let restarted = connection(&directory);
     assert_eq!(
-        restarted
-            .authentication_data
-            .token
-            .as_ref()
-            .expect("restored migrated token")
-            .expires_at,
+        restarted.authentication_data.token.as_ref().expect("restored migrated token").expires_at,
         expires_at
     );
     assert_eq!(directory.saved()["token"]["expires_at"], expires_at);
@@ -1494,28 +1235,15 @@ async fn transient_refresh_failure_retains_memory_and_disk_state_for_retry() {
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
     let saved_before = fs::read(directory.authentication_file()).expect("saved state before refresh");
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::NetworkError(_))
-    ));
-    let retained = connection
-        .authentication_data
-        .token
-        .as_ref()
-        .expect("token retained after transient error");
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::NetworkError(_))));
+    let retained = connection.authentication_data.token.as_ref().expect("token retained after transient error");
     assert_eq!(retained.access_token, "old-access");
     assert_eq!(retained.refresh_token.as_deref(), Some("old-refresh"));
     assert_eq!(retained.expires_at, expires_at);
     assert!(connection.pending_authorization.is_none());
     assert!(connection.pending_code.is_none());
-    assert_eq!(
-        fs::read(directory.authentication_file()).expect("state remains saved"),
-        saved_before
-    );
-    assert_eq!(
-        connection.update().await.expect("retry transient refresh failure"),
-        DEVICES
-    );
+    assert_eq!(fs::read(directory.authentication_file()).expect("state remains saved"), saved_before);
+    assert_eq!(connection.update().await.expect("retry transient refresh failure"), DEVICES);
     assert_eq!(directory.saved()["token"]["refresh_token"], "recovered-refresh");
     let requests = server.finish();
     assert_refresh(&requests[0], "old-refresh");
@@ -1587,12 +1315,7 @@ async fn repeated_api_401_is_bounded_and_clears_authentication_for_reauthorizati
     ]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
-    let authorization = authorization_required(
-        connection
-            .update()
-            .await
-            .expect_err("second 401 requires authorization"),
-    );
+    let authorization = authorization_required(connection.update().await.expect_err("second 401 requires authorization"));
     assert_cleared(&connection, &directory);
     assert_eq!(authorization, connection.auth_url());
     assert_eq!(
@@ -1627,25 +1350,13 @@ async fn api_401_with_transient_refresh_failure_retains_authorization_for_retry(
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
     let saved_before = fs::read(directory.authentication_file()).expect("saved state");
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::NetworkError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::NetworkError(_))));
     assert!(connection.pending_authorization.is_none());
     assert_eq!(
-        connection
-            .authentication_data
-            .token
-            .as_ref()
-            .expect("token retained")
-            .refresh_token
-            .as_deref(),
+        connection.authentication_data.token.as_ref().expect("token retained").refresh_token.as_deref(),
         Some("stored-refresh")
     );
-    assert_eq!(
-        fs::read(directory.authentication_file()).expect("saved state retained"),
-        saved_before
-    );
+    assert_eq!(fs::read(directory.authentication_file()).expect("saved state retained"), saved_before);
     let requests = server.finish();
     requests[0].assert_bearer_api("rejected-access");
     assert_refresh(&requests[1], "stored-refresh");
@@ -1706,26 +1417,18 @@ async fn revocation_failures_attempt_both_tokens_and_preserve_local_state_for_re
                 ],
                 move |request| {
                     assert_eq!(request.path, "/revoke");
-                    let saved: serde_json::Value = serde_json::from_slice(
-                        &fs::read(&authentication_file).expect("revocation intent saved before network"),
-                    )
-                    .expect("persisted revocation intent is valid JSON");
+                    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&authentication_file).expect("revocation intent saved before network"))
+                        .expect("persisted revocation intent is valid JSON");
                     assert_eq!(saved["revocation_pending"], true);
                     assert_eq!(saved["token"], observed_token);
                 },
             );
             use_mock(&mut connection, &server);
             let authorization = connection.auth_url();
-            assert!(matches!(
-                connection.revoke_authorization().await,
-                Err(MqttBridgeError::NetworkError(_))
-            ));
+            assert!(matches!(connection.revoke_authorization().await, Err(MqttBridgeError::NetworkError(_))));
             assert_revocation_pending(&connection, &directory, &expected_token);
             for _ in 0..2 {
-                assert!(matches!(
-                    connection.update().await,
-                    Err(MqttBridgeError::RuntimeError(_))
-                ));
+                assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
                 assert_revocation_pending(&connection, &directory, &expected_token);
                 assert_eq!(connection.auth_url(), authorization);
             }
@@ -1734,25 +1437,14 @@ async fn revocation_failures_attempt_both_tokens_and_preserve_local_state_for_re
             use_mock(&mut restarted, &server);
             assert_revocation_pending(&restarted, &directory, &expected_token);
             for _ in 0..2 {
-                assert!(matches!(
-                    restarted.update().await,
-                    Err(MqttBridgeError::RuntimeError(_))
-                ));
+                assert!(matches!(restarted.update().await, Err(MqttBridgeError::RuntimeError(_))));
                 assert_revocation_pending(&restarted, &directory, &expected_token);
                 assert!(restarted.pending_authorization.is_none());
             }
-            restarted
-                .revoke_authorization()
-                .await
-                .expect("retry both revocations after restart");
+            restarted.revoke_authorization().await.expect("retry both revocations after restart");
             assert_cleared(&restarted, &directory);
             assert!(restarted.pending_authorization.is_none());
-            authorization_required(
-                restarted
-                    .update()
-                    .await
-                    .expect_err("explicit retry permits new authorization"),
-            );
+            authorization_required(restarted.update().await.expect_err("explicit retry permits new authorization"));
             let requests = server.finish();
             assert_revocations(&requests[..2]);
             assert_revocations(&requests[2..]);
@@ -1770,10 +1462,7 @@ async fn revocation_accepts_numeric_zero_error_code_envelopes_for_both_tokens() 
     ]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
-    connection
-        .revoke_authorization()
-        .await
-        .expect("numeric zero means revocation succeeded");
+    connection.revoke_authorization().await.expect("numeric zero means revocation succeeded");
     assert_cleared(&connection, &directory);
     assert_revocations(&server.finish());
 }
@@ -1807,22 +1496,13 @@ async fn invalid_revocation_success_envelopes_fail_both_attempts_and_retain_retr
         use_mock(&mut connection, &server);
         let expected_token = directory.saved()["token"].clone();
         assert!(
-            matches!(
-                connection.revoke_authorization().await,
-                Err(MqttBridgeError::NetworkError(_))
-            ),
+            matches!(connection.revoke_authorization().await, Err(MqttBridgeError::NetworkError(_))),
             "accepted invalid revocation envelope: {body:?}"
         );
         assert_revocation_pending(&connection, &directory, &expected_token);
-        assert!(matches!(
-            connection.update().await,
-            Err(MqttBridgeError::RuntimeError(_))
-        ));
+        assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
         assert_revocation_pending(&connection, &directory, &expected_token);
-        connection
-            .revoke_authorization()
-            .await
-            .expect("retry with valid revocation responses");
+        connection.revoke_authorization().await.expect("retry with valid revocation responses");
         assert_cleared(&connection, &directory);
         let requests = server.finish();
         assert_revocations(&requests[..2]);
@@ -1840,10 +1520,7 @@ async fn authentication_file_deletion_failure_is_retried_before_authorization_wi
     let previous_authorization = connection.auth_url();
     fs::remove_file(directory.authentication_file()).expect("remove token file before deterministic blocker");
     fs::create_dir(directory.authentication_file()).expect("block file deletion with a directory");
-    assert!(matches!(
-        connection.clear_authentication_data(),
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.clear_authentication_data(), Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.authentication_data.token.is_none());
     assert!(!connection.authentication_data.revocation_pending);
     assert!(connection.pending_code.is_none());
@@ -1851,21 +1528,13 @@ async fn authentication_file_deletion_failure_is_retried_before_authorization_wi
     assert!(!connection.persistence_pending);
     assert!(connection.deletion_pending);
     for _ in 0..2 {
-        assert!(matches!(
-            connection.update().await,
-            Err(MqttBridgeError::RuntimeError(_))
-        ));
+        assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
         assert!(connection.deletion_pending);
         assert!(connection.pending_authorization.is_none());
         assert!(directory.authentication_file().is_dir());
     }
     fs::remove_dir(directory.authentication_file()).expect("remove deterministic deletion blocker");
-    let next = authorization_required(
-        connection
-            .update()
-            .await
-            .expect_err("fresh authorization after cleanup"),
-    );
+    let next = authorization_required(connection.update().await.expect_err("fresh authorization after cleanup"));
     assert_cleared(&connection, &directory);
     assert_ne!(query(&next)["state"], query(&previous_authorization)["state"]);
     assert_eq!(
@@ -1879,25 +1548,15 @@ async fn authentication_file_deletion_failure_is_retried_before_authorization_wi
 async fn refresh_persistence_failure_retries_the_write_without_refreshing_rotated_tokens_again() {
     let directory = TempDirectory::new();
     directory.seed_token("old-access", Some("old-refresh"), now().saturating_sub(60));
-    let server = MockServer::new(vec![
-        MockResponse::token("rotated-access", Some("rotated-refresh")),
-        MockResponse::devices(),
-    ]);
+    let server = MockServer::new(vec![MockResponse::token("rotated-access", Some("rotated-refresh")), MockResponse::devices()]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
     fs::remove_file(directory.authentication_file()).expect("remove token file before deterministic blocker");
     fs::create_dir(directory.authentication_file()).expect("block persistence rename with a directory");
     let before = now();
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     let after = now();
-    let retained = connection
-        .authentication_data
-        .token
-        .as_ref()
-        .expect("rotated token retained in memory");
+    let retained = connection.authentication_data.token.as_ref().expect("rotated token retained in memory");
     assert_eq!(retained.access_token, "rotated-access");
     assert_eq!(retained.refresh_token.as_deref(), Some("rotated-refresh"));
     assert!((before + 3600..=after + 3600).contains(&retained.expires_at));
@@ -1906,37 +1565,16 @@ async fn refresh_persistence_failure_retries_the_write_without_refreshing_rotate
     assert!(!connection.deletion_pending);
     assert!(!connection.authentication_data.revocation_pending);
     assert!(directory.authentication_file().is_dir());
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.persistence_pending);
-    assert_eq!(
-        fs::read_dir(directory.path())
-            .expect("list authentication directory")
-            .count(),
-        1
-    );
+    assert_eq!(fs::read_dir(directory.path()).expect("list authentication directory").count(), 1);
     fs::remove_dir(directory.authentication_file()).expect("remove deterministic persistence blocker");
-    assert_eq!(
-        connection
-            .update()
-            .await
-            .expect("persist retained rotation and fetch devices"),
-        DEVICES
-    );
+    assert_eq!(connection.update().await.expect("persist retained rotation and fetch devices"), DEVICES);
     assert!(!connection.persistence_pending);
     assert_eq!(directory.saved()["token"], expected_token);
     let restarted = self::connection(&directory);
     assert_eq!(
-        serde_json::to_value(
-            restarted
-                .authentication_data
-                .token
-                .as_ref()
-                .expect("restored rotated token")
-        )
-        .expect("serialize restored token"),
+        serde_json::to_value(restarted.authentication_data.token.as_ref().expect("restored rotated token")).expect("serialize restored token"),
         expected_token
     );
     let requests = server.finish();
@@ -1947,48 +1585,26 @@ async fn refresh_persistence_failure_retries_the_write_without_refreshing_rotate
 #[tokio::test]
 async fn code_exchange_persistence_failure_retries_the_write_without_reusing_the_code() {
     let directory = TempDirectory::new();
-    let server = MockServer::new(vec![
-        MockResponse::token("code-access", Some("code-refresh")),
-        MockResponse::devices(),
-    ]);
+    let server = MockServer::new(vec![MockResponse::token("code-access", Some("code-refresh")), MockResponse::devices()]);
     let mut connection = connection(&directory);
     use_mock(&mut connection, &server);
     let authorization = query(&connection.auth_url());
     connection
-        .set_authorization_code(callback(
-            REDIRECT_URI,
-            &[("code", "single-use-code"), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(REDIRECT_URI, &[("code", "single-use-code"), ("state", &authorization["state"])]))
         .expect("accept callback before persistence failure");
     fs::create_dir(directory.authentication_file()).expect("block persistence rename with a directory");
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.pending_code.is_none());
     assert!(connection.pending_authorization.is_none());
     assert!(connection.persistence_pending);
-    let retained = connection
-        .authentication_data
-        .token
-        .as_ref()
-        .expect("exchanged token retained in memory");
+    let retained = connection.authentication_data.token.as_ref().expect("exchanged token retained in memory");
     assert_eq!(retained.access_token, "code-access");
     assert_eq!(retained.refresh_token.as_deref(), Some("code-refresh"));
     let expected_token = serde_json::to_value(retained).expect("serialize exchanged token");
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.persistence_pending);
     fs::remove_dir(directory.authentication_file()).expect("remove deterministic persistence blocker");
-    assert_eq!(
-        connection
-            .update()
-            .await
-            .expect("persist exchanged token and fetch devices"),
-        DEVICES
-    );
+    assert_eq!(connection.update().await.expect("persist exchanged token and fetch devices"), DEVICES);
     assert!(!connection.persistence_pending);
     assert!(connection.pending_code.is_none());
     assert_eq!(directory.saved()["token"], expected_token);
@@ -2009,28 +1625,16 @@ async fn revocation_intent_persistence_failure_blocks_network_until_the_write_ca
     let expected_token = directory.saved()["token"].clone();
     fs::remove_file(directory.authentication_file()).expect("remove token file before deterministic blocker");
     fs::create_dir(directory.authentication_file()).expect("block revocation intent persistence with a directory");
-    assert!(matches!(
-        connection.revoke_authorization().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.revoke_authorization().await, Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.authentication_data.revocation_pending);
     assert!(connection.persistence_pending);
     assert!(!connection.deletion_pending);
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     assert!(connection.persistence_pending);
     fs::remove_dir(directory.authentication_file()).expect("remove deterministic persistence blocker");
-    assert!(matches!(
-        connection.update().await,
-        Err(MqttBridgeError::RuntimeError(_))
-    ));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::RuntimeError(_))));
     assert_revocation_pending(&connection, &directory, &expected_token);
-    connection
-        .revoke_authorization()
-        .await
-        .expect("explicit retry after intent is persisted");
+    connection.revoke_authorization().await.expect("explicit retry after intent is persisted");
     assert_cleared(&connection, &directory);
     assert_revocations(&server.finish());
 }
@@ -2053,12 +1657,9 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
     use_mock(&mut connection, &provider);
     let connection = Arc::new(Mutex::new(connection));
     let refresh = Arc::new(Notify::new());
-    let web_state = crate::web::WebState::new(connection.clone(), refresh.clone(), redirect.clone(), address)
-        .expect("create web state");
+    let web_state = crate::web::WebState::new(connection.clone(), refresh.clone(), redirect.clone(), address).expect("create web state");
     let task = tokio::spawn(async move {
-        axum::serve(listener, crate::web::router(web_state))
-            .await
-            .expect("serve web UI");
+        axum::serve(listener, crate::web::router(web_state)).await.expect("serve web UI");
     });
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -2085,15 +1686,10 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
         .json()
         .await
         .expect("login response");
-    let authorization =
-        query(&Url::parse(start["authorization_url"].as_str().expect("login URL")).expect("parse login URL"));
+    let authorization = query(&Url::parse(start["authorization_url"].as_str().expect("login URL")).expect("parse login URL"));
     assert_eq!(authorization["redirect_uri"], redirect);
     let callback_url = callback(&redirect, &[("code", "web-code"), ("state", &authorization["state"])]);
-    let response = client
-        .get(&callback_url)
-        .send()
-        .await
-        .expect("provider browser redirect");
+    let response = client.get(&callback_url).send().await.expect("provider browser redirect");
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers()["location"], "/?auth=success");
     tokio::time::timeout(Duration::from_secs(1), refresh.notified())
@@ -2115,9 +1711,7 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
     let repeated = client.get(callback_url).send().await.expect("replay callback");
     assert_eq!(repeated.headers()["location"], "/?auth=error");
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), refresh.notified())
-            .await
-            .is_err(),
+        tokio::time::timeout(Duration::from_millis(20), refresh.notified()).await.is_err(),
         "a rejected callback must not cause an extra cloud poll"
     );
     let response = client
@@ -2136,11 +1730,7 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_cleared(&*connection.lock().await, &directory);
     let requests = provider.finish();
-    assert_eq!(
-        requests.len(),
-        3,
-        "callback exchanges tokens but does not wait for device polling"
-    );
+    assert_eq!(requests.len(), 3, "callback exchanges tokens but does not wait for device polling");
     let form = requests[0].assert_client_form("/token");
     assert_eq!(form["grant_type"], "authorization_code");
     assert_eq!(form["code"], "web-code");
@@ -2150,10 +1740,7 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
         PkceCodeChallenge::from_code_verifier_sha256(&verifier).as_str(),
         authorization["code_challenge"]
     );
-    for (request, token, hint) in [
-        (&requests[1], "code-access", "access_token"),
-        (&requests[2], "code-refresh", "refresh_token"),
-    ] {
+    for (request, token, hint) in [(&requests[1], "code-access", "access_token"), (&requests[2], "code-refresh", "refresh_token")] {
         let form = request.assert_client_form("/revoke");
         assert_eq!(form["token"], token);
         assert_eq!(form["token_type_hint"], hint);
@@ -2169,15 +1756,9 @@ async fn revoke_without_tokens_discards_pending_code_without_network_io() {
     use_mock(&mut connection, &server);
     let authorization = query(&connection.auth_url());
     connection
-        .set_authorization_code(callback(
-            REDIRECT_URI,
-            &[("code", "unused-code"), ("state", &authorization["state"])],
-        ))
+        .set_authorization_code(callback(REDIRECT_URI, &[("code", "unused-code"), ("state", &authorization["state"])]))
         .expect("accept pending code");
-    connection
-        .revoke_authorization()
-        .await
-        .expect("clear pending authorization");
+    connection.revoke_authorization().await.expect("clear pending authorization");
     assert_cleared(&connection, &directory);
     assert!(connection.pending_authorization.is_none());
     let next = authorization_required(connection.update().await.expect_err("new authorization needed"));

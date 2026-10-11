@@ -144,10 +144,7 @@ pub fn domestic_hot_water_topic(base_topic: &str) -> Result<MqttData, MqttBridge
     Ok(MqttData::new(topic, serde_json::to_string(&water_heater)?))
 }
 
-pub(crate) fn with_temperature_metadata(
-    mut data: MqttData,
-    metadata: Option<&serde_json::Value>,
-) -> Result<MqttData, MqttBridgeError> {
+pub(crate) fn with_temperature_metadata(mut data: MqttData, metadata: Option<&serde_json::Value>) -> Result<MqttData, MqttBridgeError> {
     if let Some(metadata) = metadata {
         let mut payload: serde_json::Value = serde_json::from_str(&data.payload)?;
         for (source, field) in [("minValue", "min_temp"), ("maxValue", "max_temp")] {
@@ -163,12 +160,7 @@ pub(crate) fn with_temperature_metadata(
     Ok(data)
 }
 
-pub(crate) fn with_device_capabilities(
-    data: MqttData,
-    base_topic: &str,
-    devices: &serde_json::Value,
-    water: bool,
-) -> Result<MqttData, MqttBridgeError> {
+pub(crate) fn with_device_capabilities(data: MqttData, base_topic: &str, devices: &serde_json::Value, water: bool) -> Result<MqttData, MqttBridgeError> {
     let mut data = with_temperature_metadata(data, commands::temperature_metadata(devices, water))?;
     let mut payload: serde_json::Value = serde_json::from_str(&data.payload)?;
     // Use the command planner itself so discovery cannot offer modes whose
@@ -189,10 +181,7 @@ pub(crate) fn with_device_capabilities(
     let power_supported = accepts("power_command_topic", "on") && accepts("power_command_topic", "off");
     if modes.is_empty() {
         // Keep recognized state modes for read-only entities, but no mode control.
-        payload
-            .as_object_mut()
-            .expect("discovery object")
-            .remove("mode_command_topic");
+        payload.as_object_mut().expect("discovery object").remove("mode_command_topic");
     } else {
         payload["modes"] = modes.into();
     }
@@ -202,10 +191,7 @@ pub(crate) fn with_device_capabilities(
         }
     }
     if !commands::temperature_writable(devices, water) {
-        payload
-            .as_object_mut()
-            .expect("discovery object")
-            .remove("temperature_command_topic");
+        payload.as_object_mut().expect("discovery object").remove("temperature_command_topic");
     }
     data.payload = serde_json::to_string(&payload)?;
     Ok(data)
@@ -217,14 +203,33 @@ mod tests {
     use serde_json::{json, Value};
 
     #[test_log::test]
-    fn climate_discovery_uses_existing_status_topics() {
-        let data = climate_control_topic("daikin").expect("serialize climate discovery");
+    fn climate_discovery_uses_existing_status_topi    use serde_json::{json, Value};
+
+            fn configured_discovery(devices: &Value, water: bool) -> Value {
+                let data = if water {
+                    domestic_hot_water_topic("house/daikin")
+                } else {
+                    climate_control_topic("house/daikin")
+                }
+                .expect("discovery");
+                let data = with_device_capabilities(data, "house/daikin", devices, water).expect("device capabilities");
+                serde_json::from_str(&data.payload).expect("discovery JSON")
+            }
+
+            fn point(devices: &mut Value, water: bool) -> &mut Value {
+                let id = if water { "domesticHotWaterTank" } else { "climateControlMainZone" };
+                devices[0]["managementPoints"]
+                    .as_array_mut()
+                    .expect("management points")
+                    .iter_mut()
+                    .find(|point| point["embeddedId"] == id)
+                    .expect("management point")
+            }
+
+            #[test_log::test].expect("serialize climate discovery");
         let payload: Value = serde_json::from_str(&data.payload).expect("valid discovery JSON");
 
-        assert_eq!(
-            data.topic,
-            "homeassistant/climate/daikin_6461696b696e_climate_control/config"
-        );
+        assert_eq!(data.topic, "homeassistant/climate/daikin_6461696b696e_climate_control/config");
         assert_eq!(payload["unique_id"], "daikin_6461696b696e_climate_control");
         assert_eq!(payload["availability_topic"], "daikin/state");
         for field in [
@@ -235,14 +240,8 @@ mod tests {
         ] {
             assert_eq!(payload[field], "daikin/climate_control");
         }
-        assert_eq!(
-            payload["current_temperature_template"],
-            "{{ value_json.room_temperature }}"
-        );
-        assert_eq!(
-            payload["temperature_state_template"],
-            "{{ value_json.heating_setpoint_room_temperature }}"
-        );
+        assert_eq!(payload["current_temperature_template"], "{{ value_json.room_temperature }}");
+        assert_eq!(payload["temperature_state_template"], "{{ value_json.heating_setpoint_room_temperature }}");
         assert_eq!(payload["mode_state_template"], MODE_STATE_TEMPLATE);
         assert_eq!(payload["modes"], json!(["off", "heat", "auto"]));
         assert_eq!(payload["temperature_unit"], "C");
@@ -250,10 +249,7 @@ mod tests {
         assert_eq!(payload["device"]["manufacturer"], "Daikin");
         assert_eq!(payload["origin"]["name"], env!("CARGO_PKG_NAME"));
         assert_eq!(payload["origin"]["sw_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(
-            payload["origin"]["support_url"],
-            "https://github.com/dirkvdb/daikin2mqtt"
-        );
+        assert_eq!(payload["origin"]["support_url"], "https://github.com/dirkvdb/daikin2mqtt");
         assert_eq!(payload["mode_command_topic"], "daikin/cmnd/climate_mode");
         assert_eq!(payload["temperature_command_topic"], "daikin/cmnd/climate_temperature");
         assert_eq!(payload["qos"], 1);
@@ -273,10 +269,7 @@ mod tests {
             payload["mode_state_template"],
             "{{ 'off' if value_json.on_off_mode == 'off' else {'heating': 'heat', 'auto': 'auto'}.get(value_json.operation_mode, 'None') }}"
         );
-        assert!(payload["modes"]
-            .as_array()
-            .expect("advertised HVAC modes")
-            .contains(&json!("auto")));
+        assert!(payload["modes"].as_array().expect("advertised HVAC modes").contains(&json!("auto")));
     }
 
     #[test_log::test]
@@ -286,10 +279,7 @@ mod tests {
         let climate = climate_control_topic("daikin").expect("serialize climate discovery");
         let climate_payload: Value = serde_json::from_str(&climate.payload).expect("valid discovery JSON");
 
-        assert_eq!(
-            data.topic,
-            "homeassistant/water_heater/daikin_6461696b696e_domestic_hot_water/config"
-        );
+        assert_eq!(data.topic, "homeassistant/water_heater/daikin_6461696b696e_domestic_hot_water/config");
         assert_eq!(payload["unique_id"], "daikin_6461696b696e_domestic_hot_water");
         assert_ne!(payload["unique_id"], climate_payload["unique_id"]);
         assert_eq!(payload["device"], climate_payload["device"]);
@@ -303,19 +293,13 @@ mod tests {
         ] {
             assert_eq!(payload[field], "daikin/domestic_hot_water");
         }
-        assert_eq!(
-            payload["current_temperature_template"],
-            "{{ value_json.water_temperature }}"
-        );
+        assert_eq!(payload["current_temperature_template"], "{{ value_json.water_temperature }}");
         assert_eq!(payload["temperature_state_template"], "{{ value_json.water_setpoint }}");
         assert_eq!(payload["mode_state_template"], WATER_HEATER_MODE_STATE_TEMPLATE);
         assert_eq!(payload["modes"], json!(["off", "heat_pump", "performance"]));
         assert_eq!(payload["temperature_unit"], "C");
         assert_eq!(payload["mode_command_topic"], "daikin/cmnd/domestic_hot_water_mode");
-        assert_eq!(
-            payload["temperature_command_topic"],
-            "daikin/cmnd/domestic_hot_water_temperature"
-        );
+        assert_eq!(payload["temperature_command_topic"], "daikin/cmnd/domestic_hot_water_temperature");
         assert_eq!(payload["qos"], 1);
         assert_eq!(payload["retain"], false);
         assert!(payload.get("temp_step").is_none());
@@ -328,12 +312,8 @@ mod tests {
         assert_eq!(payload["modes"], json!(["off", "heat_pump", "performance"]));
         assert_eq!(payload["mode_state_template"],
             "{{ 'off' if value_json.on_off_mode == 'off' else 'performance' if value_json.powerfull_mode | default(false) else {'heating': 'heat_pump'}.get(value_json.operation_mode, 'None') }}");
-        let devices: Value =
-            serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
-        let message = MqttData::new(
-            payload["mode_command_topic"].as_str().expect("mode topic").into(),
-            "performance".into(),
-        );
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
+        let message = MqttData::new(payload["mode_command_topic"].as_str().expect("mode topic").into(), "performance".into());
         let updates = commands::updates("home/daikin", &message, &devices).expect("performance command");
         assert_eq!(updates.last().expect("boost update").characteristic, "powerfulMode");
         assert_eq!(updates.last().expect("boost update").value, "on");
@@ -341,15 +321,11 @@ mod tests {
 
     #[test_log::test]
     fn water_heater_power_discovery_routes_both_payloads_to_on_off_mode() {
-        let devices: Value =
-            serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
         for base in ["daikin", "home/daikin"] {
             let data = domestic_hot_water_topic(base).expect("water heater discovery");
             let payload: Value = serde_json::from_str(&data.payload).expect("discovery JSON");
-            assert_eq!(
-                payload["power_command_topic"],
-                format!("{base}/cmnd/domestic_hot_water_power")
-            );
+            assert_eq!(payload["power_command_topic"], format!("{base}/cmnd/domestic_hot_water_power"));
             assert_eq!(payload["payload_on"], "on");
             assert_eq!(payload["payload_off"], "off");
             for (field, power) in [("payload_on", "on"), ("payload_off", "off")] {
@@ -406,6 +382,105 @@ mod tests {
                 .as_str()
                 .expect("command topic")
                 .starts_with("house/daikin/cmnd/"));
+        }
+    }
+
+    #[test_log::test]
+    fn fixture_discovery_only_advertises_usable_commands() {
+        for fixture in [
+            include_str!("../resources/test/managementpoints.json"),
+            include_str!("../resources/test/managementpoints2.json"),
+        ] {
+            let devices: Value = serde_json::from_str(fixture).expect("device fixture");
+            for water in [false, true] {
+                let payload = configured_discovery(&devices, water);
+                assert_eq!(payload["modes"], if water { json!(["off", "heat_pump", "performance"]) } else { json!(["off", "heat"]) });
+                for mode in payload["modes"].as_array().expect("modes") {
+                    let message = MqttData::new(
+                        payload["mode_command_topic"].as_str().expect("mode topic").into(),
+                        mode.as_str().expect("mode").into(),
+                    );
+                    assert!(commands::updates("house/daikin", &message, &devices).is_ok());
+                }
+                for field in ["payload_on", "payload_off"] {
+                    let message = MqttData::new(
+                        payload["power_command_topic"].as_str().expect("power topic").into(),
+                        payload[field].as_str().expect("power payload").into(),
+                    );
+                    let updates = commands::updates("house/daikin", &message, &devices).expect("power command");
+                    assert_eq!(updates.len(), 1);
+                    assert_eq!(updates[0].characteristic, "onOffMode");
+                    assert_eq!(updates[0].value, payload[field]);
+                }
+                assert_eq!(payload["min_temp"], if water { 30 } else { 12 });
+                assert_eq!(payload["max_temp"], if water { 60 } else { 24 });
+                if water {
+                    assert!(payload.get("temperature_command_topic").is_none());
+                    assert_eq!(payload["temperature_state_template"], "{{ value_json.water_setpoint }}");
+                } else {
+                    assert_eq!(payload["temp_step"], 0.5);
+                    for temperature in [12.0, 20.5, 24.0] {
+                        let message = MqttData::new(
+                            payload["temperature_command_topic"].as_str().expect("temperature topic").into(),
+                            temperature.to_string(),
+                        );
+                        assert!(commands::updates("house/daikin", &message, &devices).is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn discovery_preserves_supported_auto_and_filters_unavailable_boost() {
+        let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
+            .expect("device fixture");
+        point(&mut devices, false)["operationMode"]["settable"] = json!(true);
+        point(&mut devices, false)["operationMode"]["values"] = json!(["heating", "auto"]);
+        assert_eq!(configured_discovery(&devices, false)["modes"], json!(["off", "heat", "auto"]));
+        for boost in [Value::Null, json!({"settable": false, "value": "off"}), json!({"settable": true, "value": "off", "values": ["off"]})] {
+            point(&mut devices, true)["powerfulMode"] = boost;
+            assert_eq!(configured_discovery(&devices, true)["modes"], json!(["off", "heat_pump"]));
+        }
+    }
+
+    #[test_log::test]
+    fn discovery_only_exposes_writable_temperature_controls() {
+        for water in [false, true] {
+            for control_writable in [false, true] {
+                for setpoint_writable in [false, true] {
+                    let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
+                        .expect("device fixture");
+                    let control = &mut point(&mut devices, water)["temperatureControl"];
+                    control["settable"] = json!(control_writable);
+                    let setpoint = if water { "domesticHotWaterTemperature" } else { "roomTemperature" };
+                    control["value"]["operationModes"]["heating"]["setpoints"][setpoint]["settable"] = json!(setpoint_writable);
+                    let payload = configured_discovery(&devices, water);
+                    assert_eq!(payload.get("temperature_command_topic").is_some(), control_writable && setpoint_writable);
+                    assert!(payload.get("temperature_state_topic").is_some());
+                    assert!(payload.get("current_temperature_topic").is_some());
+                }
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn discovery_removes_commands_for_read_only_missing_or_ambiguous_targets() {
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
+            .expect("device fixture");
+        let mut read_only = devices.clone();
+        for water in [false, true] {
+            point(&mut read_only, water)["onOffMode"]["settable"] = json!(false);
+            point(&mut read_only, water)["temperatureControl"]["settable"] = json!(false);
+        }
+        for snapshot in [read_only, Value::Null, json!([]), json!([devices[0], devices[0]])] {
+            for water in [false, true] {
+                let payload = configured_discovery(&snapshot, water);
+                for field in ["mode_command_topic", "power_command_topic", "payload_on", "payload_off", "temperature_command_topic"] {
+                    assert!(payload.get(field).is_none(), "{field}: {payload}");
+                }
+                assert!(payload.get("mode_state_topic").is_some());
+            }
         }
     }
 

@@ -7,9 +7,9 @@ use std::{
 
 use oauth2::{
     basic::{BasicClient, BasicErrorResponseType, BasicTokenResponse, BasicTokenType},
-    AccessToken, AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
-    HttpClientError, HttpRequest, HttpResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
-    RequestTokenError, RevocationUrl, Scope, StandardRevocableToken, TokenResponse, TokenUrl,
+    AccessToken, AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, HttpClientError, HttpRequest,
+    HttpResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, RevocationUrl, Scope, StandardRevocableToken,
+    TokenResponse, TokenUrl,
 };
 use reqwest::{StatusCode, Url};
 
@@ -70,23 +70,13 @@ pub struct DaikinCloudConnection {
 }
 
 impl DaikinCloudConnection {
-    pub fn new(
-        client_id: String,
-        client_secret: String,
-        redirect_uri: String,
-        data_dir: &Path,
-    ) -> Result<Self, MqttBridgeError> {
+    pub fn new(client_id: String, client_secret: String, redirect_uri: String, data_dir: &Path) -> Result<Self, MqttBridgeError> {
         if client_id.is_empty() || client_secret.is_empty() {
-            return Err(MqttBridgeError::RuntimeError(
-                "OAuth client credentials must not be empty".into(),
-            ));
+            return Err(MqttBridgeError::RuntimeError("OAuth client credentials must not be empty".into()));
         }
-        let redirect = RedirectUrl::new(redirect_uri.clone())
-            .map_err(|_| MqttBridgeError::RuntimeError("Invalid OAuth redirect URI".into()))?;
+        let redirect = RedirectUrl::new(redirect_uri.clone()).map_err(|_| MqttBridgeError::RuntimeError("Invalid OAuth redirect URI".into()))?;
         if redirect.url().query().is_some() || redirect.url().fragment().is_some() {
-            return Err(MqttBridgeError::RuntimeError(
-                "OAuth redirect URI must not contain a query or fragment".into(),
-            ));
+            return Err(MqttBridgeError::RuntimeError("OAuth redirect URI must not contain a query or fragment".into()));
         }
         let oauth_client = BasicClient::new(ClientId::new(client_id))
             .set_client_secret(ClientSecret::new(client_secret))
@@ -180,11 +170,7 @@ impl DaikinCloudConnection {
                 self.pending_code = None;
                 self.accept_token(token)
             }
-            Err(RequestTokenError::ServerResponse(ref error))
-                if *error.error() == BasicErrorResponseType::InvalidGrant =>
-            {
-                Err(self.authorization_required()?)
-            }
+            Err(RequestTokenError::ServerResponse(ref error)) if *error.error() == BasicErrorResponseType::InvalidGrant => Err(self.authorization_required()?),
             Err(_) => Err(MqttBridgeError::NetworkError(
                 "Authorization code exchange failed; check OAuth credentials and provider availability".into(),
             )),
@@ -192,12 +178,8 @@ impl DaikinCloudConnection {
     }
 
     pub fn set_authorization_code(&mut self, callback: String) -> Result<(), MqttBridgeError> {
-        let invalid = || {
-            MqttBridgeError::RuntimeError(
-                "Invalid authorization callback: expected the registered redirect URL with code and matching state"
-                    .into(),
-            )
-        };
+        let invalid =
+            || MqttBridgeError::RuntimeError("Invalid authorization callback: expected the registered redirect URL with code and matching state".into());
         let mut url = Url::parse(callback.trim()).map_err(|_| invalid())?;
         if url.fragment().is_some() {
             return Err(invalid());
@@ -221,9 +203,7 @@ impl DaikinCloudConnection {
         }
         let code = code.filter(|value| !value.is_empty()).ok_or_else(invalid)?;
         if self.authentication_data.token.is_some() {
-            return Err(MqttBridgeError::RuntimeError(
-                "Revoke the existing integration before authorizing again".into(),
-            ));
+            return Err(MqttBridgeError::RuntimeError("Revoke the existing integration before authorizing again".into()));
         }
         let pending = self.pending_authorization.take().ok_or_else(invalid)?;
         self.pending_code = Some(PendingCode {
@@ -272,10 +252,7 @@ impl DaikinCloudConnection {
             return Err(self.authorization_required()?);
         }
         if !response.status().is_success() {
-            return Err(MqttBridgeError::NetworkError(format!(
-                "Gateway device request failed: {}",
-                response.status()
-            )));
+            return Err(MqttBridgeError::NetworkError(format!("Gateway device request failed: {}", response.status())));
         }
         response
             .text()
@@ -301,8 +278,7 @@ impl DaikinCloudConnection {
                 "Characteristic endpoint must not contain dot-only path segments".into(),
             ));
         }
-        let mut url =
-            Url::parse(&self.api).map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?;
+        let mut url = Url::parse(&self.api).map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?;
         url.path_segments_mut()
             .map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?
             .pop_if_empty()
@@ -329,24 +305,13 @@ impl DaikinCloudConnection {
             return Err(self.authorization_required()?);
         }
         if !response.status().is_success() {
-            return Err(MqttBridgeError::NetworkError(format!(
-                "Characteristic update failed: {}",
-                response.status()
-            )));
+            return Err(MqttBridgeError::NetworkError(format!("Characteristic update failed: {}", response.status())));
         }
         Ok(())
     }
 
-    async fn patch_characteristic(
-        &self,
-        url: &Url,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response, MqttBridgeError> {
-        let token = self
-            .authentication_data
-            .token
-            .as_ref()
-            .ok_or(MqttBridgeError::NotAuhrorized)?;
+    async fn patch_characteristic(&self, url: &Url, body: &serde_json::Value) -> Result<reqwest::Response, MqttBridgeError> {
+        let token = self.authentication_data.token.as_ref().ok_or(MqttBridgeError::NotAuhrorized)?;
         self.http_client
             .patch(url.clone())
             .header("Accept", "application/json")
@@ -358,11 +323,7 @@ impl DaikinCloudConnection {
     }
 
     async fn refresh_access_token(&mut self) -> Result<(), MqttBridgeError> {
-        let refresh = self
-            .authentication_data
-            .token
-            .as_ref()
-            .and_then(|token| token.refresh_token.clone());
+        let refresh = self.authentication_data.token.as_ref().and_then(|token| token.refresh_token.clone());
         let Some(refresh) = refresh.filter(|value| !value.is_empty()) else {
             return Err(self.authorization_required()?);
         };
@@ -380,11 +341,7 @@ impl DaikinCloudConnection {
                 }
                 self.accept_token(token)
             }
-            Err(RequestTokenError::ServerResponse(ref error))
-                if *error.error() == BasicErrorResponseType::InvalidGrant =>
-            {
-                Err(self.authorization_required()?)
-            }
+            Err(RequestTokenError::ServerResponse(ref error)) if *error.error() == BasicErrorResponseType::InvalidGrant => Err(self.authorization_required()?),
             Err(_) => Err(MqttBridgeError::NetworkError(
                 "Token refresh failed; stored refresh token retained for retry".into(),
             )),
@@ -393,9 +350,7 @@ impl DaikinCloudConnection {
 
     fn accept_token(&mut self, token: BasicTokenResponse) -> Result<(), MqttBridgeError> {
         if token.token_type() != &BasicTokenType::Bearer || token.access_token().secret().is_empty() {
-            return Err(MqttBridgeError::RuntimeError(
-                "Provider did not return a Bearer access token".into(),
-            ));
+            return Err(MqttBridgeError::RuntimeError("Provider did not return a Bearer access token".into()));
         }
         let lifetime = token
             .expires_in()
@@ -410,11 +365,7 @@ impl DaikinCloudConnection {
     }
 
     async fn gateway_devices(&self) -> Result<reqwest::Response, MqttBridgeError> {
-        let token = self
-            .authentication_data
-            .token
-            .as_ref()
-            .ok_or(MqttBridgeError::NotAuhrorized)?;
+        let token = self.authentication_data.token.as_ref().ok_or(MqttBridgeError::NotAuhrorized)?;
         self.http_client
             .get(format!("{}gateway-devices", self.api))
             .header("Accept", "application/json")
@@ -434,9 +385,7 @@ impl DaikinCloudConnection {
         }
         let mut failed = false;
         if let Some(token) = self.authentication_data.token.as_ref() {
-            let mut tokens = vec![StandardRevocableToken::AccessToken(AccessToken::new(
-                token.access_token.clone(),
-            ))];
+            let mut tokens = vec![StandardRevocableToken::AccessToken(AccessToken::new(token.access_token.clone()))];
             if let Some(refresh) = &token.refresh_token {
                 tokens.push(StandardRevocableToken::RefreshToken(RefreshToken::new(refresh.clone())));
             }
@@ -446,29 +395,20 @@ impl DaikinCloudConnection {
                     .oauth_client
                     .revoke_token(token)
                     .map_err(|_| MqttBridgeError::RuntimeError("Invalid revocation endpoint".into()))?;
-                if request
-                    .request_async(&|request| self.oauth_http(request))
-                    .await
-                    .is_err()
-                {
+                if request.request_async(&|request| self.oauth_http(request)).await.is_err() {
                     failed = true;
                 }
             }
         }
         if failed {
-            return Err(MqttBridgeError::NetworkError(
-                "Token revocation failed; retry disconnect in the web UI".into(),
-            ));
+            return Err(MqttBridgeError::NetworkError("Token revocation failed; retry disconnect in the web UI".into()));
         }
         self.clear_authentication_data()
     }
 
     // oauth2 handles protocol requests and responses. This adapter reuses our bounded,
     // non-redirecting HTTP client and accepts ONECTA's documented omission of token_type.
-    fn oauth_http(
-        &self,
-        request: HttpRequest,
-    ) -> impl std::future::Future<Output = Result<HttpResponse, HttpClientError<reqwest::Error>>> + Send + 'static {
+    fn oauth_http(&self, request: HttpRequest) -> impl std::future::Future<Output = Result<HttpResponse, HttpClientError<reqwest::Error>>> + Send + 'static {
         // Own the cheap client handle so HTTP handlers can await this future without
         // borrowing the whole cloud connection through oauth2's higher-ranked adapter.
         let http_client = self.http_client.clone();
@@ -486,18 +426,11 @@ impl DaikinCloudConnection {
                 .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?;
             let status_code = response.status();
             let headers = response.headers().clone();
-            let mut body = response
-                .bytes()
-                .await
-                .map_err(|error| HttpClientError::Reqwest(Box::new(error)))?
-                .to_vec();
+            let mut body = response.bytes().await.map_err(|error| HttpClientError::Reqwest(Box::new(error)))?.to_vec();
             if status_code.is_success() && revocation && !body.is_empty() {
-                let envelope: serde_json::Value = serde_json::from_slice(&body)
-                    .map_err(|_| HttpClientError::Other("Invalid revocation response".into()))?;
+                let envelope: serde_json::Value = serde_json::from_slice(&body).map_err(|_| HttpClientError::Other("Invalid revocation response".into()))?;
                 if envelope.get("errorCode").and_then(serde_json::Value::as_u64) != Some(0) {
-                    return Err(HttpClientError::Other(
-                        "Provider reported token revocation failure".into(),
-                    ));
+                    return Err(HttpClientError::Other("Provider reported token revocation failure".into()));
                 }
             }
             if status_code.is_success() && !revocation {
@@ -558,11 +491,8 @@ impl DaikinCloudConnection {
     }
 
     fn store_authentication_data(&mut self) -> Result<(), MqttBridgeError> {
-        fs::create_dir_all(&self.data_dir)
-            .map_err(|_| MqttBridgeError::RuntimeError("Failed to create authentication directory".into()))?;
-        let temporary = self
-            .data_dir
-            .join(format!(".authentication-{}.tmp", CsrfToken::new_random().secret()));
+        fs::create_dir_all(&self.data_dir).map_err(|_| MqttBridgeError::RuntimeError("Failed to create authentication directory".into()))?;
+        let temporary = self.data_dir.join(format!(".authentication-{}.tmp", CsrfToken::new_random().secret()));
         let result = (|| -> Result<(), MqttBridgeError> {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -581,9 +511,7 @@ impl DaikinCloudConnection {
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
-            return Err(MqttBridgeError::RuntimeError(
-                "Failed to securely persist authentication data".into(),
-            ));
+            return Err(MqttBridgeError::RuntimeError("Failed to securely persist authentication data".into()));
         }
         self.persistence_pending = false;
         Ok(())
@@ -591,12 +519,9 @@ impl DaikinCloudConnection {
 
     fn restore_authentication_data(data_dir: &Path) -> Result<AuthenticationData, MqttBridgeError> {
         match fs::read_to_string(Self::authentication_data_path(data_dir)) {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|_| MqttBridgeError::RuntimeError("Failed to parse authentication file".into())),
+            Ok(json) => serde_json::from_str(&json).map_err(|_| MqttBridgeError::RuntimeError("Failed to parse authentication file".into())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AuthenticationData::default()),
-            Err(_) => Err(MqttBridgeError::RuntimeError(
-                "Failed to read authentication file".into(),
-            )),
+            Err(_) => Err(MqttBridgeError::RuntimeError("Failed to read authentication file".into())),
         }
     }
 }
@@ -605,8 +530,5 @@ impl DaikinCloudConnection {
 mod tests;
 
 fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }

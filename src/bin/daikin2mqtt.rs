@@ -106,9 +106,7 @@ fn secret_spec() -> secretspec::Result<Secrets> {
 
 fn bridge_config(opt: Opt, mut secrets: HashMap<String, SecretBytes>) -> secretspec::Result<DaikinMqttBridgeConfig> {
     let mut take_secret = |name: &str| -> secretspec::Result<String> {
-        let value = secrets
-            .remove(name)
-            .ok_or_else(|| SecretSpecError::RequiredSecretMissing(name.to_owned()))?;
+        let value = secrets.remove(name).ok_or_else(|| SecretSpecError::RequiredSecretMissing(name.to_owned()))?;
         Ok(value.try_as_utf8_for(name)?.to_owned())
     };
 
@@ -138,9 +136,7 @@ mod tests {
     use std::io::Write;
 
     fn parse_args(args: &[&str]) -> Result<Opt, clap::Error> {
-        let matches = Opt::command()
-            .mut_args(|arg| arg.env(None::<&str>))
-            .try_get_matches_from(args)?;
+        let matches = Opt::command().mut_args(|arg| arg.env(None::<&str>)).try_get_matches_from(args)?;
         Opt::from_arg_matches(&matches)
     }
 
@@ -156,8 +152,7 @@ mod tests {
 
     #[test_log::test]
     fn parses_hass_discovery_flag() {
-        let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--hass-discovery"])
-            .expect("valid Home Assistant discovery flag");
+        let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--hass-discovery"]).expect("valid Home Assistant discovery flag");
 
         assert!(opt.hass_discovery);
     }
@@ -174,14 +169,8 @@ mod tests {
 
     #[test_log::test]
     fn parses_custom_redirect_uri() {
-        let opt = parse_args(&[
-            "daikin2mqtt",
-            "--mqtt-addr",
-            "localhost",
-            "--daikin-redirect-uri",
-            "https://example.com",
-        ])
-        .expect("valid custom redirect base URI");
+        let opt =
+            parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--daikin-redirect-uri", "https://example.com"]).expect("valid custom redirect base URI");
 
         assert_eq!(opt.cloud_redirect_uri, "https://example.com/oauth/callback");
     }
@@ -189,30 +178,15 @@ mod tests {
     #[test_log::test]
     fn normalizes_redirect_bases_and_preserves_full_callback_uris() {
         for (configured, callback) in [
-            (
-                "https://bridge.example.com",
-                "https://bridge.example.com/oauth/callback",
-            ),
-            (
-                "https://bridge.example.com/",
-                "https://bridge.example.com/oauth/callback",
-            ),
+            ("https://bridge.example.com", "https://bridge.example.com/oauth/callback"),
+            ("https://bridge.example.com/", "https://bridge.example.com/oauth/callback"),
             ("http://localhost:8076", "http://localhost:8076/oauth/callback"),
             ("https://example.com:8443/", "https://example.com:8443/oauth/callback"),
             ("http://[::1]:8076/", "http://[::1]:8076/oauth/callback"),
-            (
-                "https://example.com/oauth/callback",
-                "https://example.com/oauth/callback",
-            ),
+            ("https://example.com/oauth/callback", "https://example.com/oauth/callback"),
         ] {
-            let opt = parse_args(&[
-                "daikin2mqtt",
-                "--mqtt-addr",
-                "localhost",
-                "--daikin-redirect-uri",
-                configured,
-            ])
-            .expect("valid redirect base or legacy callback");
+            let opt =
+                parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--daikin-redirect-uri", configured]).expect("valid redirect base or legacy callback");
             assert_eq!(opt.cloud_redirect_uri, callback);
         }
     }
@@ -229,15 +203,9 @@ mod tests {
             "https://example.com/other",
             "https://example.com/oauth/callback/",
         ] {
-            let err = parse_args(&[
-                "daikin2mqtt",
-                "--mqtt-addr",
-                "localhost",
-                "--daikin-redirect-uri",
-                configured,
-            ])
-            .err()
-            .expect("invalid redirect base must fail argument validation");
+            let err = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--daikin-redirect-uri", configured])
+                .err()
+                .expect("invalid redirect base must fail argument validation");
             assert_eq!(err.kind(), ErrorKind::ValueValidation);
         }
     }
@@ -245,13 +213,9 @@ mod tests {
     #[test_log::test]
     fn parses_custom_web_listen() {
         for address in ["0.0.0.0:9090", "[::1]:8081"] {
-            let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--web-listen", address])
-                .expect("valid web listen address");
+            let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--web-listen", address]).expect("valid web listen address");
 
-            assert_eq!(
-                opt.web_listen,
-                address.parse::<SocketAddr>().expect("valid socket address")
-            );
+            assert_eq!(opt.web_listen, address.parse::<SocketAddr>().expect("valid socket address"));
         }
     }
 
@@ -278,15 +242,9 @@ mod tests {
 
     #[test_log::test]
     fn rejects_oauth_client_id_as_a_cli_option() {
-        let err = parse_args(&[
-            "daikin2mqtt",
-            "--mqtt-addr",
-            "localhost",
-            "--daikin-client-id",
-            "test-client",
-        ])
-        .err()
-        .expect("OAuth client ID must come from SecretSpec");
+        let err = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--daikin-client-id", "test-client"])
+            .err()
+            .expect("OAuth client ID must come from SecretSpec");
 
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
@@ -294,14 +252,8 @@ mod tests {
     #[test_log::test]
     fn configures_non_secret_environment_without_client_id_collision() {
         let command = Opt::command();
-        for (id, env) in [
-            ("mqtt_client_id", "DAIKIN_MQTT_CLIENT_ID"),
-            ("cloud_redirect_uri", "DAIKIN_REDIRECT_URI"),
-        ] {
-            let arg = command
-                .get_arguments()
-                .find(|arg| arg.get_id() == id)
-                .expect("non-secret argument exists");
+        for (id, env) in [("mqtt_client_id", "DAIKIN_MQTT_CLIENT_ID"), ("cloud_redirect_uri", "DAIKIN_REDIRECT_URI")] {
+            let arg = command.get_arguments().find(|arg| arg.get_id() == id).expect("non-secret argument exists");
             assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
         }
         for arg in command.get_arguments() {
@@ -320,12 +272,7 @@ mod tests {
     #[test_log::test]
     fn secrets_are_not_exposed_as_cli_options() {
         let help = Opt::command().render_long_help().to_string();
-        for option in [
-            "--daikin-client-id",
-            "--daikin-client-secret",
-            "--mqtt-user",
-            "--mqtt-pass",
-        ] {
+        for option in ["--daikin-client-id", "--daikin-client-secret", "--mqtt-user", "--mqtt-pass"] {
             assert!(!help.contains(option));
         }
     }
@@ -340,9 +287,8 @@ mod tests {
 
     #[test_log::test]
     fn loads_embedded_secret_spec_into_bridge_config() {
-        let secrets =
-            resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
-                .expect("all required secrets are available");
+        let secrets = resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
+            .expect("all required secrets are available");
         let opt = parse_args(&[
             "daikin2mqtt",
             "--mqtt-addr",
@@ -385,9 +331,8 @@ mod tests {
                 args.push("--hass-discovery");
             }
             let opt = parse_args(&args).expect("valid Home Assistant discovery options");
-            let secrets =
-                resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
-                    .expect("all required secrets are available");
+            let secrets = resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
+                .expect("all required secrets are available");
             let cfg = bridge_config(opt, secrets).expect("valid bridge configuration");
 
             assert_eq!(cfg.hass_discovery, enabled);

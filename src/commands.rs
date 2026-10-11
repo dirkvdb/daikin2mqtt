@@ -34,23 +34,15 @@ fn target<'a>(devices: &'a Value, embedded_id: &str) -> Result<(&'a str, &'a Val
         .ok_or_else(|| invalid("No cloud device snapshot available; wait for a successful poll"))?
         .iter()
         .flat_map(|device| {
-            device["managementPoints"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(move |point| {
-                    (point["embeddedId"].as_str() == Some(embedded_id))
-                        .then(|| device["id"].as_str().map(|id| (id, point)))
-                        .flatten()
-                })
+            device["managementPoints"].as_array().into_iter().flatten().filter_map(move |point| {
+                (point["embeddedId"].as_str() == Some(embedded_id))
+                    .then(|| device["id"].as_str().map(|id| (id, point)))
+                    .flatten()
+            })
         });
-    let first = matches
-        .next()
-        .ok_or_else(|| invalid("Command management point not found"))?;
+    let first = matches.next().ok_or_else(|| invalid("Command management point not found"))?;
     if matches.next().is_some() {
-        return Err(invalid(
-            "Command target is ambiguous: multiple gateways expose this entity",
-        ));
+        return Err(invalid("Command target is ambiguous: multiple gateways expose this entity"));
     }
     Ok(first)
 }
@@ -81,44 +73,18 @@ fn validate(metadata: &Value, value: &Value) -> Result<(), MqttBridgeError> {
 }
 
 pub(crate) fn temperature_metadata(devices: &Value, water: bool) -> Option<&Value> {
-    let (_, point) = target(
-        devices,
-        if water {
-            "domesticHotWaterTank"
-        } else {
-            "climateControlMainZone"
-        },
-    )
-    .ok()?;
-    Some(
-        &point["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"][if water {
-            "domesticHotWaterTemperature"
-        } else {
-            "roomTemperature"
-        }],
-    )
+    let (_, point) = target(devices, if water { "domesticHotWaterTank" } else { "climateControlMainZone" }).ok()?;
+    Some(&point["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"][if water { "domesticHotWaterTemperature" } else { "roomTemperature" }])
 }
 
 pub(crate) fn temperature_writable(devices: &Value, water: bool) -> bool {
-    target(
-        devices,
-        if water {
-            "domesticHotWaterTank"
-        } else {
-            "climateControlMainZone"
-        },
-    )
-    .is_ok_and(|(_, point)| {
+    target(devices, if water { "domesticHotWaterTank" } else { "climateControlMainZone" }).is_ok_and(|(_, point)| {
         point["temperatureControl"]["settable"].as_bool() == Some(true)
             && temperature_metadata(devices, water).is_some_and(|metadata| metadata["settable"].as_bool() == Some(true))
     })
 }
 
-pub(crate) fn updates(
-    base: &str,
-    message: &MqttData,
-    devices: &Value,
-) -> Result<Vec<CharacteristicUpdate>, MqttBridgeError> {
+pub(crate) fn updates(base: &str, message: &MqttData, devices: &Value) -> Result<Vec<CharacteristicUpdate>, MqttBridgeError> {
     let command = message
         .topic
         .strip_prefix(&format!("{base}/cmnd/"))
@@ -128,17 +94,9 @@ pub(crate) fn updates(
         CLIMATE_TEMPERATURE => (false, true),
         WATER_MODE | WATER_POWER => (true, false),
         WATER_TEMPERATURE => (true, true),
-        _ => {
-            return Err(invalid(
-                "Unknown MQTT command; authentication is only available in the web UI",
-            ))
-        }
+        _ => return Err(invalid("Unknown MQTT command; authentication is only available in the web UI")),
     };
-    let embedded_id = if water {
-        "domesticHotWaterTank"
-    } else {
-        "climateControlMainZone"
-    };
+    let embedded_id = if water { "domesticHotWaterTank" } else { "climateControlMainZone" };
     let (gateway_id, point) = target(devices, embedded_id)?;
     let update = |characteristic, path, value| CharacteristicUpdate {
         gateway_id: gateway_id.into(),
@@ -157,27 +115,19 @@ pub(crate) fn updates(
         return Ok(vec![update("onOffMode", None, value)]);
     }
     if temperature {
-        let number: f64 = payload
-            .parse()
-            .map_err(|_| invalid("Temperature command must be a number"))?;
+        let number: f64 = payload.parse().map_err(|_| invalid("Temperature command must be a number"))?;
         if !number.is_finite() {
             return Err(invalid("Temperature command must be finite"));
         }
         let path = format!(
             "/operationModes/heating/setpoints/{}",
-            if water {
-                "domesticHotWaterTemperature"
-            } else {
-                "roomTemperature"
-            }
+            if water { "domesticHotWaterTemperature" } else { "roomTemperature" }
         );
         let control = &point["temperatureControl"];
         if control["settable"].as_bool() != Some(true) {
             return Err(invalid("Temperature control is read-only"));
         }
-        let metadata = control["value"]
-            .pointer(&path)
-            .ok_or_else(|| invalid("Temperature setpoint not found"))?;
+        let metadata = control["value"].pointer(&path).ok_or_else(|| invalid("Temperature setpoint not found"))?;
         let value = json!(number);
         validate(metadata, &value)?;
         return Ok(vec![update("temperatureControl", Some(path), value)]);
@@ -267,8 +217,7 @@ mod tests {
     #[test]
     fn boiler_performance_enables_power_then_powerful_mode() {
         let devices = devices();
-        let result =
-            updates("home/daikin", &message(WATER_MODE, "performance"), &devices).expect("performance command");
+        let result = updates("home/daikin", &message(WATER_MODE, "performance"), &devices).expect("performance command");
         assert_eq!(result.len(), 2);
         for update in &result {
             assert_eq!(update.gateway_id, devices[0]["id"]);
@@ -364,10 +313,7 @@ mod tests {
 
     #[test]
     fn power_commands_validate_on_off_metadata() {
-        for (command, id) in [
-            (CLIMATE_POWER, "climateControlMainZone"),
-            (WATER_POWER, "domesticHotWaterTank"),
-        ] {
+        for (command, id) in [(CLIMATE_POWER, "climateControlMainZone"), (WATER_POWER, "domesticHotWaterTank")] {
             for power in ["on", "off"] {
                 for metadata in [
                     Value::Null,
@@ -387,10 +333,7 @@ mod tests {
 
     #[test]
     fn power_commands_use_custom_base_topics_and_trim_payloads() {
-        for (command, id) in [
-            (CLIMATE_POWER, "climateControlMainZone"),
-            (WATER_POWER, "domesticHotWaterTank"),
-        ] {
+        for (command, id) in [(CLIMATE_POWER, "climateControlMainZone"), (WATER_POWER, "domesticHotWaterTank")] {
             for base in ["custom/heat-pump", "another/site/daikin"] {
                 for power in ["on", "off"] {
                     let msg = MqttData::new(topic(base, command), format!(" \n{power}\t "));
@@ -408,24 +351,8 @@ mod tests {
     #[test]
     fn power_commands_reject_invalid_payloads() {
         for command in [CLIMATE_POWER, WATER_POWER] {
-            for payload in [
-                "heat",
-                "heat_pump",
-                "auto",
-                "performance",
-                "ON",
-                "OFF",
-                "true",
-                "false",
-                "1",
-                "0",
-                "",
-                " \t",
-            ] {
-                assert!(
-                    updates("home/daikin", &message(command, payload), &devices()).is_err(),
-                    "{command}: {payload}"
-                );
+            for payload in ["heat", "heat_pump", "auto", "performance", "ON", "OFF", "true", "false", "1", "0", "", " \t"] {
+                assert!(updates("home/daikin", &message(command, payload), &devices()).is_err(), "{command}: {payload}");
             }
         }
     }
@@ -449,20 +376,14 @@ mod tests {
     fn temperatures_use_nested_paths_and_preserve_fractional_values() {
         for (command, id, setpoint, temperature) in [
             (CLIMATE_TEMPERATURE, "climateControlMainZone", "roomTemperature", 20.5),
-            (
-                WATER_TEMPERATURE,
-                "domesticHotWaterTank",
-                "domesticHotWaterTemperature",
-                48.5,
-            ),
+            (WATER_TEMPERATURE, "domesticHotWaterTank", "domesticHotWaterTemperature", 48.5),
         ] {
             let mut devices = devices();
             let p = point(&mut devices, id);
             let metadata = &mut p["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"][setpoint];
             metadata["settable"] = json!(true);
             metadata["stepValue"] = json!(0.5);
-            let result = updates("home/daikin", &message(command, &temperature.to_string()), &devices)
-                .expect("temperature command");
+            let result = updates("home/daikin", &message(command, &temperature.to_string()), &devices).expect("temperature command");
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].management_point, id);
             assert_eq!(result[0].characteristic, "temperatureControl");
@@ -485,8 +406,7 @@ mod tests {
                     let mut devices = devices();
                     let control = &mut point(&mut devices, id)["temperatureControl"];
                     control["settable"] = control_settable.clone();
-                    control["value"]["operationModes"]["heating"]["setpoints"][setpoint]["settable"] =
-                        setpoint_settable.clone();
+                    control["value"]["operationModes"]["heating"]["setpoints"][setpoint]["settable"] = setpoint_settable.clone();
                     assert_eq!(
                         temperature_writable(&devices, water),
                         control_settable == true && setpoint_settable == true,
@@ -517,16 +437,11 @@ mod tests {
                 format!("/temperatureControl/value/operationModes/heating/setpoints/{setpoint}/settable"),
             ] {
                 let mut missing = devices.clone();
-                *point(&mut missing, id)
-                    .pointer_mut(&path)
-                    .expect("temperature metadata") = Value::Null;
+                *point(&mut missing, id).pointer_mut(&path).expect("temperature metadata") = Value::Null;
                 assert!(!temperature_writable(&missing, water), "{id}: {path}");
             }
             let mut missing = devices.clone();
-            point(&mut missing, id)
-                .as_object_mut()
-                .expect("point")
-                .remove("temperatureControl");
+            point(&mut missing, id).as_object_mut().expect("point").remove("temperatureControl");
             assert!(!temperature_writable(&missing, water));
         }
     }
@@ -563,10 +478,7 @@ mod tests {
             ("auth", "code"),
             ("climate_mode/extra", "heat"),
         ] {
-            assert!(
-                updates("home/daikin", &message(command, payload), &devices()).is_err(),
-                "{command}: {payload}"
-            );
+            assert!(updates("home/daikin", &message(command, payload), &devices()).is_err(), "{command}: {payload}");
         }
         assert!(updates("other/base", &message(CLIMATE_MODE, "heat"), &devices()).is_err());
     }
