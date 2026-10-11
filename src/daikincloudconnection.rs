@@ -70,6 +70,11 @@ pub struct DaikinCloudConnection {
 }
 
 impl DaikinCloudConnection {
+    #[cfg(test)]
+    pub(crate) fn set_test_api_endpoint(&mut self, api: String) {
+        self.api = api;
+    }
+
     pub fn new(client_id: String, client_secret: String, redirect_uri: String, data_dir: &Path) -> Result<Self, MqttBridgeError> {
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(MqttBridgeError::RuntimeError("OAuth client credentials must not be empty".into()));

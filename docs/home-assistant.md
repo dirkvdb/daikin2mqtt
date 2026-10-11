@@ -123,14 +123,46 @@ boiler setpoint marked read-only by Daikin cannot be changed by the bridge.
 Commands are rejected if multiple gateways expose the same entity, rather than
 sending them to an arbitrary device. Authentication remains web-UI-only.
 
-After a command attempt, the bridge requests fresh cloud state; it does not
-optimistically report success. Daikin may take time to reflect changes, so the
-normal polling cycle also continues. Failed commands are logged and are not
-queued for later replay. Retained incoming commands are ignored; do not retain
-commands in manual MQTT publishers either, since brokers can deliver a live
-retained publication without marking it as retained to existing subscribers.
+After Daikin accepts all writes for a command, the bridge schedules exactly one
+status refresh after a 2-second delay. A new valid command received while that
+refresh is pending resets the timer; successful completion starts a full
+2-second delay again. Repeated temperature increases therefore share one status
+read rather than causing a read for every increase. The delay does not block
+MQTT processing, and there is no retry loop or optimistic state update.
+
+The scheduled refresh replaces a regular poll due during the delay, and the
+normal polling interval restarts after a status read to avoid back-to-back
+requests. A failed command does not schedule a new refresh. If the single status
+read fails or still reports old values, the bridge waits for the next regular
+poll instead of spending additional daily API quota. API acceptance does not
+guarantee that the cloud will reflect a change within 2 seconds.
+
+Failed commands are logged and are not queued for later replay. Retained incoming
+commands are ignored; do not retain commands in manual MQTT publishers either,
+since brokers can deliver a live retained publication without marking it as
+retained to existing subscribers.
 
 Discovery configuration is published with retain enabled on every successful
 status update. Home Assistant can discover the entity after connecting, and a
 broker restart that loses retained messages is repaired by the next successful
 status update.
+
+## Command logging
+
+At the default `INFO` log level, each received control command includes its MQTT
+topic and payload. Each successfully sent Daikin update also includes the target
+gateway, management point, characteristic, nested path (`/` for a root value),
+and JSON value. Update positions such as `1/2` identify multi-write commands
+like water-heater boost. The final command summary includes the update count.
+These messages confirm that the API accepted the writes, not that the device has
+already reported the new state.
+
+Validation failures include the topic, payload, and reason at `WARN`. A failed
+API write also identifies the failed update and the number of previously sent
+updates, making partial failures visible. Ignored retained commands include their
+command details at `WARN`. Unknown command-topic payloads are redacted to avoid
+logging credentials or legacy authentication codes; quoted strings escape
+newlines and other control characters.
+
+Set `RUST_LOG=daikin2mqtt=debug` to also log each update before the API request,
+which helps distinguish an in-flight write from an accepted or failed write.

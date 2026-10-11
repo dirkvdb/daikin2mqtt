@@ -15,6 +15,8 @@ use tokio::{
 
 use crate::web;
 
+const COMMAND_REFRESH_DELAY: time::Duration = time::Duration::from_secs(2);
+
 #[derive(Default, Serialize)]
 struct ClimateControl {
     holiday_mode_active: bool,
@@ -73,6 +75,7 @@ pub struct DaikinMqttBridge {
     data_dir: std::path::PathBuf,
     status: MqttStatus,
     devices: Value,
+    command_refresh_deadline: Option<time::Instant>,
 }
 
 impl DaikinMqttBridge {
@@ -88,6 +91,7 @@ impl DaikinMqttBridge {
             data_dir: cfg.data_dir,
             status: MqttStatus::default(),
             devices: Value::Null,
+            command_refresh_deadline: None,
         }
     }
 
@@ -115,32 +119,59 @@ impl DaikinMqttBridge {
     async fn run_bridge(mut self, connection: Arc<Mutex<DaikinCloudConnection>>, refresh: Arc<Notify>) -> Result<(), MqttBridgeError> {
         let mut interval = time::interval(self.poll_interval);
         loop {
+            let command_refresh_deadline = self.command_refresh_deadline;
             tokio::select! {
                 mqtt_msg = self.mqtt.poll() => {
                     if let Ok(Some(msg)) = mqtt_msg {
-                        if let Err(err) = self.handle_command(&connection, &refresh, &msg).await {
-                            log::warn!("MQTT command {} failed: {err}", msg.topic);
+                        if let Err(err) = self.handle_command(&connection, &msg).await {
+                            log::warn!("MQTT command failed: {}, error={err}", commands::details(self.mqtt.base_topic(), &msg));
                         }
                     }
                 }
                 _ = interval.tick() => {
-                    if let Err(err) = self.poll_cloud(&connection).await {
-                        log::error!("Failed to poll cloud: ({err})");
+                    // A scheduled command refresh also covers a regular poll due
+                    // during the debounce window; do not read stale state early.
+                    if self.command_refresh_deadline.is_none_or(|deadline| deadline <= time::Instant::now()) {
+                        self.command_refresh_deadline = None;
+                        if let Err(err) = self.poll_cloud(&connection).await {
+                            log::error!("Failed to poll cloud: ({err})");
+                        }
+                        interval.reset();
                     }
                 }
                 _ = refresh.notified() => {
+                    // Authentication changes still request an immediate refresh.
+                    self.command_refresh_deadline = None;
                     if let Err(err) = self.poll_cloud(&connection).await {
                         log::error!("Failed to poll cloud: ({err})");
                     }
+                    interval.reset();
+                }
+                _ = wait_for_command_refresh(command_refresh_deadline) => {
+                    // Consume the deadline even on failure: this is one read,
+                    // not a retry loop, because Daikin limits daily API calls.
+                    self.command_refresh_deadline = None;
+                    log::info!("Refreshing cloud status after MQTT command");
+                    if let Err(err) = self.poll_cloud(&connection).await {
+                        log::error!("Failed to poll cloud after MQTT command: ({err})");
+                    }
+                    interval.reset();
                 }
             }
         }
     }
 
-    async fn handle_command(&mut self, connection: &Mutex<DaikinCloudConnection>, refresh: &Notify, message: &MqttData) -> Result<(), MqttBridgeError> {
+    async fn handle_command(&mut self, connection: &Mutex<DaikinCloudConnection>, message: &MqttData) -> Result<(), MqttBridgeError> {
+        let details = commands::details(self.mqtt.base_topic(), message);
+        log::info!("Received MQTT command: {details}");
         let updates = commands::updates(self.mqtt.base_topic(), message, &self.devices)?;
+        if self.command_refresh_deadline.is_some() {
+            self.command_refresh_deadline = Some(time::Instant::now() + COMMAND_REFRESH_DELAY);
+        }
+        let update_count = updates.len();
         let mut cloud = connection.lock().await;
-        for update in updates {
+        for (index, update) in updates.into_iter().enumerate() {
+            log::debug!("Sending Daikin update {}/{}: {details}, {update}", index + 1, update_count);
             let result = cloud
                 .set_characteristic(
                     &update.gateway_id,
@@ -150,12 +181,20 @@ impl DaikinMqttBridge {
                     &update.value,
                 )
                 .await;
-            // Re-read actual state even if a multi-write mode command partly fails.
-            // Never optimistically publish an unconfirmed device setting.
-            refresh.notify_one();
-            result?;
+
+            if let Err(err) = result {
+                log::warn!(
+                    "Daikin update {}/{} failed: {details}, {update}, sent_updates={index}, error={err}",
+                    index + 1,
+                    update_count,
+                );
+                return Err(err);
+            }
+            log::info!("Sent Daikin update {}/{}: {details}, {update}", index + 1, update_count);
         }
-        log::info!("Sent MQTT command: {}", message.topic);
+        log::info!("Sent MQTT command: {details}, updates={update_count}");
+        self.command_refresh_deadline = Some(time::Instant::now() + COMMAND_REFRESH_DELAY);
+        log::debug!("Scheduled one cloud status refresh in 2 seconds: {details}");
         Ok(())
     }
 
@@ -288,6 +327,17 @@ impl DaikinMqttBridge {
         Ok(status)
     }
 }
+
+async fn wait_for_command_refresh(deadline: Option<time::Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+#[path = "bridge/command_refresh_tests.rs"]
+mod command_refresh_tests;
 
 fn parse_i8(value: &Value) -> Result<i8, MqttBridgeError> {
     value.as_i64().ok_or(MqttBridgeError::ParseError).map(|v| v as i8)

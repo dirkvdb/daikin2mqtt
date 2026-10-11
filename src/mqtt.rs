@@ -128,7 +128,11 @@ impl MqttConnection {
                 }
                 Packet::Publish(publ) => {
                     if publ.retain {
-                        log::warn!("Ignored retained MQTT command");
+                        let message = MqttData::new(
+                            String::from_utf8_lossy(&publ.topic).into_owned(),
+                            String::from_utf8_lossy(&publ.payload).into_owned(),
+                        );
+                        log::warn!("Ignored retained MQTT command: {}", crate::commands::details(&self.base_topic, &message));
                         return Ok(None);
                     }
                     return Ok(Some(MqttData {

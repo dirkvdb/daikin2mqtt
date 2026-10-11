@@ -22,8 +22,59 @@ pub(crate) struct CharacteristicUpdate {
     pub value: Value,
 }
 
+impl std::fmt::Display for CharacteristicUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gateway={:?}, management_point={:?}, characteristic={:?}, path={:?}, value={}",
+            self.gateway_id,
+            self.management_point,
+            self.characteristic,
+            self.path.as_deref().unwrap_or("/"),
+            self.value,
+        )
+    }
+}
+
+pub(crate) struct CommandDetails<'a> {
+    message: &'a MqttData,
+    log_payload: bool,
+}
+
+impl std::fmt::Display for CommandDetails<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "topic={:?}, payload=", self.message.topic)?;
+        if self.log_payload {
+            write!(f, "{:?}", self.message.payload)
+        } else {
+            f.write_str("<redacted: unsupported command>")
+        }
+    }
+}
+
+pub(crate) fn details<'a>(base: &str, message: &'a MqttData) -> CommandDetails<'a> {
+    CommandDetails {
+        message,
+        // Unknown topics may carry credentials or old MQTT authentication codes.
+        log_payload: command_kind(base, &message.topic).is_ok(),
+    }
+}
+
 fn invalid(message: &str) -> MqttBridgeError {
     MqttBridgeError::RuntimeError(message.into())
+}
+
+fn command_kind(base: &str, topic: &str) -> Result<(bool, bool), MqttBridgeError> {
+    let command = topic
+        .strip_prefix(&format!("{base}/cmnd/"))
+        .ok_or_else(|| invalid("Unknown MQTT command topic"))?;
+    match command {
+        CLIMATE_MODE | CLIMATE_POWER => Ok((false, false)),
+        CLIMATE_TEMPERATURE => Ok((false, true)),
+        WATER_MODE | WATER_POWER => Ok((true, false)),
+        WATER_TEMPERATURE => Ok((true, true)),
+        _ => Err(invalid("Unknown MQTT command; authentication is only available in the web UI")),
+    }
 }
 
 // Resolve against the same snapshot used for state publication. Never guess a gateway
@@ -89,13 +140,7 @@ pub(crate) fn updates(base: &str, message: &MqttData, devices: &Value) -> Result
         .topic
         .strip_prefix(&format!("{base}/cmnd/"))
         .ok_or_else(|| invalid("Unknown MQTT command topic"))?;
-    let (water, temperature) = match command {
-        CLIMATE_MODE | CLIMATE_POWER => (false, false),
-        CLIMATE_TEMPERATURE => (false, true),
-        WATER_MODE | WATER_POWER => (true, false),
-        WATER_TEMPERATURE => (true, true),
-        _ => return Err(invalid("Unknown MQTT command; authentication is only available in the web UI")),
-    };
+    let (water, temperature) = command_kind(base, &message.topic)?;
     let embedded_id = if water { "domesticHotWaterTank" } else { "climateControlMainZone" };
     let (gateway_id, point) = target(devices, embedded_id)?;
     let update = |characteristic, path, value| CharacteristicUpdate {
@@ -194,6 +239,62 @@ mod tests {
             .iter_mut()
             .find(|p| p["embeddedId"] == id)
             .expect("point")
+    }
+
+    #[test]
+    fn command_details_include_control_payloads_even_when_invalid() {
+        for base in ["daikin", "house/heat-pump"] {
+            for (command, payload) in [
+                (CLIMATE_MODE, "auto"),
+                (CLIMATE_POWER, "off"),
+                (CLIMATE_TEMPERATURE, "20.5"),
+                (WATER_MODE, "performance"),
+                (WATER_POWER, "on"),
+                (WATER_TEMPERATURE, "invalid-temperature"),
+            ] {
+                let topic = topic(base, command);
+                let message = MqttData::new(topic.clone(), payload.into());
+                assert_eq!(details(base, &message).to_string(), format!("topic={topic:?}, payload={payload:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn command_details_redact_unknown_topics_and_escape_control_characters() {
+        for topic in [
+            "home/daikin/cmnd/auth",
+            "home/daikin/cmnd/climate_mode/extra",
+            "other/cmnd/climate_power",
+            "home/daikin/cmnd/unknown\n",
+        ] {
+            let message = MqttData::new(topic.into(), "secret-authentication-code".into());
+            let logged = details("home/daikin", &message).to_string();
+            assert_eq!(logged, format!("topic={topic:?}, payload=<redacted: unsupported command>"));
+            assert!(!logged.contains("secret-authentication-code"));
+            assert!(!logged.contains('\n'));
+        }
+        let message = message(CLIMATE_TEMPERATURE, "20.5\n\t\"injected\"");
+        let logged = details("home/daikin", &message).to_string();
+        assert_eq!(logged, "topic=\"home/daikin/cmnd/climate_temperature\", payload=\"20.5\\n\\t\\\"injected\\\"\"");
+        assert!(!logged.contains('\n'));
+    }
+
+    #[test]
+    fn update_details_include_targets_paths_and_json_values() {
+        let update = updates("home/daikin", &message(CLIMATE_TEMPERATURE, "20.5"), &devices())
+            .expect("temperature command")
+            .remove(0);
+        assert_eq!(
+            update.to_string(),
+            "gateway=\"c6d05dff-db9b-4565-825b-000000000000\", management_point=\"climateControlMainZone\", characteristic=\"temperatureControl\", path=\"/operationModes/heating/setpoints/roomTemperature\", value=20.5",
+        );
+        let updates = updates("home/daikin", &message(WATER_MODE, "performance"), &devices()).expect("boost command");
+        for (update, characteristic) in updates.iter().zip(["onOffMode", "powerfulMode"]) {
+            assert_eq!(
+                update.to_string(),
+                format!("gateway=\"c6d05dff-db9b-4565-825b-000000000000\", management_point=\"domesticHotWaterTank\", characteristic={characteristic:?}, path=\"/\", value=\"on\""),
+            );
+        }
     }
 
     #[test]
