@@ -1,4 +1,5 @@
 use crate::daikincloudconnection::DaikinCloudConnection;
+use crate::hassdiscovery;
 use crate::mqtt::{MqttConfig, MqttConnection, MqttData};
 use crate::MqttBridgeError;
 use log;
@@ -12,8 +13,6 @@ use tokio::{
 };
 
 use crate::web;
-
-//const HASS_DISCOVERY_TOPIC: &str = "homeassistant";
 
 #[derive(Default, Serialize)]
 struct ClimateControl {
@@ -52,7 +51,7 @@ pub struct DaikinMqttBridgeConfig {
     pub cloud_client_secret: String,
     pub cloud_redirect_uri: String,
     pub web_listen: std::net::SocketAddr,
-    //pub hass_discovery: bool,
+    pub hass_discovery: bool,
     pub poll_interval: time::Duration,
     pub data_dir: std::path::PathBuf,
 }
@@ -68,7 +67,7 @@ pub struct DaikinMqttBridge {
     cloud_client_secret: String,
     cloud_redirect_uri: String,
     web_listen: std::net::SocketAddr,
-    //hass_discovery: bool,
+    hass_discovery: bool,
     poll_interval: time::Duration,
     data_dir: std::path::PathBuf,
     status: MqttStatus,
@@ -82,7 +81,7 @@ impl DaikinMqttBridge {
             cloud_client_secret: cfg.cloud_client_secret,
             cloud_redirect_uri: cfg.cloud_redirect_uri,
             web_listen: cfg.web_listen,
-            //hass_discovery: cfg.hass_discovery,
+            hass_discovery: cfg.hass_discovery,
             poll_interval: cfg.poll_interval,
             data_dir: cfg.data_dir,
             status: MqttStatus::default(),
@@ -190,6 +189,14 @@ impl DaikinMqttBridge {
     }
 
     async fn update_heatpump_status(&mut self, status: DaikinStatus) -> Result<(), MqttBridgeError> {
+        if self.hass_discovery {
+            // Republish with status so discovery also recovers after a broker restart.
+            let climate = hassdiscovery::climate_control_topic(self.mqtt.base_topic())?;
+            let water_heater = hassdiscovery::domestic_hot_water_topic(self.mqtt.base_topic())?;
+            self.mqtt.publish(climate, true).await?;
+            self.mqtt.publish(water_heater, true).await?;
+        }
+
         let climate_control_json = to_string(&status.climate_control)?;
         let domestic_hot_water_tank_json = to_string(&status.domestic_hot_water_tank)?;
         self.mqtt
@@ -299,6 +306,104 @@ fn parse_bool(value: &Value) -> Result<bool, MqttBridgeError> {
 // Test for parsing response json
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+    use rumqttc::v5::mqttbytes::{v5::Packet, Error as MqttError, QoS};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_packet(stream: &mut tokio::net::TcpStream, buffer: &mut BytesMut) -> Packet {
+        loop {
+            match Packet::read(buffer, None) {
+                Ok(packet) => return packet,
+                Err(MqttError::InsufficientBytes(_)) => {
+                    assert!(stream.read_buf(buffer).await.expect("read MQTT packet") > 0);
+                }
+                Err(err) => panic!("invalid MQTT packet: {err}"),
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn publishes_retained_discovery_only_when_enabled() {
+        for enabled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test MQTT broker");
+            let mut bridge = DaikinMqttBridge::new(DaikinMqttBridgeConfig {
+                mqtt_config: MqttConfig {
+                    server: "127.0.0.1".to_owned(),
+                    port: listener.local_addr().expect("broker address").port(),
+                    client_id: "discovery-test".to_owned(),
+                    user: String::new(),
+                    password: String::new(),
+                    base_topic: "test/daikin".to_owned(),
+                },
+                cloud_client_id: String::new(),
+                cloud_client_secret: String::new(),
+                cloud_redirect_uri: "http://localhost:8076/oauth/callback".to_owned(),
+                web_listen: "127.0.0.1:0".parse().expect("web address"),
+                hass_discovery: enabled,
+                poll_interval: time::Duration::from_secs(600),
+                data_dir: PathBuf::new(),
+            });
+            let discovery = [
+                hassdiscovery::climate_control_topic("test/daikin").expect("climate discovery data"),
+                hassdiscovery::domestic_hot_water_topic("test/daikin").expect("water heater discovery data"),
+            ];
+            let mut expected_topics = Vec::new();
+            for _ in 0..2 {
+                bridge
+                    .update_heatpump_status(DaikinStatus::default())
+                    .await
+                    .expect("queue status update");
+                if enabled {
+                    expected_topics.extend(discovery.iter().map(|data| data.topic.clone()));
+                }
+                expected_topics.push("test/daikin/climate_control".to_owned());
+                expected_topics.push("test/daikin/domestic_hot_water".to_owned());
+            }
+
+            let broker = async {
+                let (mut stream, _) = listener.accept().await.expect("accept MQTT connection");
+                let mut buffer = BytesMut::new();
+                assert!(matches!(
+                    read_packet(&mut stream, &mut buffer).await,
+                    Packet::Connect(..)
+                ));
+                // MQTT 5 CONNACK: successful connection, no existing session or properties.
+                stream
+                    .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+                    .await
+                    .expect("send CONNACK");
+                for topic in expected_topics {
+                    loop {
+                        if let Packet::Publish(publish) = read_packet(&mut stream, &mut buffer).await {
+                            assert_eq!(publish.topic.as_ref(), topic.as_bytes());
+                            assert!(publish.retain);
+                            assert_eq!(publish.qos, QoS::AtLeastOnce);
+                            if let Some(data) = discovery.iter().find(|data| data.topic == topic) {
+                                assert_eq!(publish.payload.as_ref(), data.payload.as_bytes());
+                            }
+                            break;
+                        }
+                    }
+                }
+            };
+            let drive_mqtt = async {
+                loop {
+                    bridge.mqtt.poll().await.expect("drive MQTT connection");
+                }
+            };
+            time::timeout(time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = broker => {}
+                    _ = drive_mqtt => panic!("MQTT event loop unexpectedly stopped"),
+                }
+            })
+            .await
+            .expect("MQTT publishing completes promptly");
+        }
+    }
+
     fn test_data_dir() -> std::path::PathBuf {
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("resources/test");

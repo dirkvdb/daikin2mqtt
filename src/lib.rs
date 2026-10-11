@@ -1,7 +1,7 @@
 #![warn(clippy::unwrap_used)]
 pub mod bridge;
 mod daikincloudconnection;
-//mod hassdiscovery;
+mod hassdiscovery;
 pub mod mqtt;
 mod web;
 

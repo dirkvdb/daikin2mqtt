@@ -44,12 +44,8 @@ struct Opt {
     #[clap(long = "mqtt-base-topic", env = "DAIKIN_MQTT_BASE_TOPIC", default_value_t = String::from("daikin"))]
     mqtt_base_topic: String,
 
-    // #[clap(
-    //     long = "hass-discovery",
-    //     env = "DAIKIN_HASS_DISCOVERY",
-    //     default_value_t = false
-    // )]
-    // hass_discovery: bool,
+    #[clap(long = "hass-discovery", env = "DAIKIN_HASS_DISCOVERY", default_value_t = false)]
+    hass_discovery: bool,
     #[clap(long = "data-dir", env = "DAIKIN_DATA_DIR", default_value_t = String::from("./data"))]
     data_dir: String,
 }
@@ -129,7 +125,7 @@ fn bridge_config(opt: Opt, mut secrets: HashMap<String, SecretBytes>) -> secrets
         cloud_client_secret: take_secret("DAIKIN_CLIENT_SECRET")?,
         cloud_redirect_uri: opt.cloud_redirect_uri,
         web_listen: opt.web_listen,
-        //hass_discovery: opt.hass_discovery,
+        hass_discovery: opt.hass_discovery,
         data_dir: PathBuf::from(opt.data_dir),
         poll_interval: time::Duration::from_secs(opt.cloud_poll_interval),
     })
@@ -155,6 +151,25 @@ mod tests {
         assert_eq!(opt.mqtt_client_id, "daikin2mqtt");
         assert_eq!(opt.cloud_redirect_uri, "http://localhost:8076/oauth/callback");
         assert_eq!(opt.web_listen, SocketAddr::from(([0, 0, 0, 0], 8076)));
+        assert!(!opt.hass_discovery);
+    }
+
+    #[test_log::test]
+    fn parses_hass_discovery_flag() {
+        let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--hass-discovery"])
+            .expect("valid Home Assistant discovery flag");
+
+        assert!(opt.hass_discovery);
+    }
+
+    #[test_log::test]
+    fn declares_hass_discovery_environment() {
+        let command = Opt::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "hass_discovery")
+            .expect("Home Assistant discovery argument exists");
+        assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("DAIKIN_HASS_DISCOVERY")));
     }
 
     #[test_log::test]
@@ -360,6 +375,23 @@ mod tests {
         assert_eq!(cfg.mqtt_config.base_topic, "home/daikin");
         assert_eq!(cfg.poll_interval, time::Duration::from_secs(60));
         assert_eq!(cfg.data_dir, PathBuf::from("test-data"));
+    }
+
+    #[test_log::test]
+    fn wires_hass_discovery_into_bridge_config() {
+        for enabled in [false, true] {
+            let mut args = vec!["daikin2mqtt", "--mqtt-addr", "localhost"];
+            if enabled {
+                args.push("--hass-discovery");
+            }
+            let opt = parse_args(&args).expect("valid Home Assistant discovery options");
+            let secrets =
+                resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
+                    .expect("all required secrets are available");
+            let cfg = bridge_config(opt, secrets).expect("valid bridge configuration");
+
+            assert_eq!(cfg.hass_discovery, enabled);
+        }
     }
 
     #[test_log::test]
