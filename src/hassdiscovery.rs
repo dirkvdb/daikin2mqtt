@@ -202,31 +202,30 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
+    fn configured_discovery(devices: &Value, water: bool) -> Value {
+        let data = if water {
+            domestic_hot_water_topic("house/daikin")
+        } else {
+            climate_control_topic("house/daikin")
+        }
+        .expect("discovery");
+        let data = with_device_capabilities(data, "house/daikin", devices, water).expect("device capabilities");
+        serde_json::from_str(&data.payload).expect("discovery JSON")
+    }
+
+    fn point(devices: &mut Value, water: bool) -> &mut Value {
+        let id = if water { "domesticHotWaterTank" } else { "climateControlMainZone" };
+        devices[0]["managementPoints"]
+            .as_array_mut()
+            .expect("management points")
+            .iter_mut()
+            .find(|point| point["embeddedId"] == id)
+            .expect("management point")
+    }
+
     #[test_log::test]
-    fn climate_discovery_uses_existing_status_topi    use serde_json::{json, Value};
-
-            fn configured_discovery(devices: &Value, water: bool) -> Value {
-                let data = if water {
-                    domestic_hot_water_topic("house/daikin")
-                } else {
-                    climate_control_topic("house/daikin")
-                }
-                .expect("discovery");
-                let data = with_device_capabilities(data, "house/daikin", devices, water).expect("device capabilities");
-                serde_json::from_str(&data.payload).expect("discovery JSON")
-            }
-
-            fn point(devices: &mut Value, water: bool) -> &mut Value {
-                let id = if water { "domesticHotWaterTank" } else { "climateControlMainZone" };
-                devices[0]["managementPoints"]
-                    .as_array_mut()
-                    .expect("management points")
-                    .iter_mut()
-                    .find(|point| point["embeddedId"] == id)
-                    .expect("management point")
-            }
-
-            #[test_log::test].expect("serialize climate discovery");
+    fn climate_discovery_uses_existing_status_topics() {
+        let data = climate_control_topic("daikin").expect("serialize climate discovery");
         let payload: Value = serde_json::from_str(&data.payload).expect("valid discovery JSON");
 
         assert_eq!(data.topic, "homeassistant/climate/daikin_6461696b696e_climate_control/config");
@@ -394,7 +393,14 @@ mod tests {
             let devices: Value = serde_json::from_str(fixture).expect("device fixture");
             for water in [false, true] {
                 let payload = configured_discovery(&devices, water);
-                assert_eq!(payload["modes"], if water { json!(["off", "heat_pump", "performance"]) } else { json!(["off", "heat"]) });
+                assert_eq!(
+                    payload["modes"],
+                    if water {
+                        json!(["off", "heat_pump", "performance"])
+                    } else {
+                        json!(["off", "heat"])
+                    }
+                );
                 for mode in payload["modes"].as_array().expect("modes") {
                     let message = MqttData::new(
                         payload["mode_command_topic"].as_str().expect("mode topic").into(),
@@ -433,12 +439,15 @@ mod tests {
 
     #[test_log::test]
     fn discovery_preserves_supported_auto_and_filters_unavailable_boost() {
-        let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
-            .expect("device fixture");
+        let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
         point(&mut devices, false)["operationMode"]["settable"] = json!(true);
         point(&mut devices, false)["operationMode"]["values"] = json!(["heating", "auto"]);
         assert_eq!(configured_discovery(&devices, false)["modes"], json!(["off", "heat", "auto"]));
-        for boost in [Value::Null, json!({"settable": false, "value": "off"}), json!({"settable": true, "value": "off", "values": ["off"]})] {
+        for boost in [
+            Value::Null,
+            json!({"settable": false, "value": "off"}),
+            json!({"settable": true, "value": "off", "values": ["off"]}),
+        ] {
             point(&mut devices, true)["powerfulMode"] = boost;
             assert_eq!(configured_discovery(&devices, true)["modes"], json!(["off", "heat_pump"]));
         }
@@ -449,8 +458,7 @@ mod tests {
         for water in [false, true] {
             for control_writable in [false, true] {
                 for setpoint_writable in [false, true] {
-                    let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
-                        .expect("device fixture");
+                    let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
                     let control = &mut point(&mut devices, water)["temperatureControl"];
                     control["settable"] = json!(control_writable);
                     let setpoint = if water { "domesticHotWaterTemperature" } else { "roomTemperature" };
@@ -466,8 +474,7 @@ mod tests {
 
     #[test_log::test]
     fn discovery_removes_commands_for_read_only_missing_or_ambiguous_targets() {
-        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json"))
-            .expect("device fixture");
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
         let mut read_only = devices.clone();
         for water in [false, true] {
             point(&mut read_only, water)["onOffMode"]["settable"] = json!(false);
@@ -476,7 +483,13 @@ mod tests {
         for snapshot in [read_only, Value::Null, json!([]), json!([devices[0], devices[0]])] {
             for water in [false, true] {
                 let payload = configured_discovery(&snapshot, water);
-                for field in ["mode_command_topic", "power_command_topic", "payload_on", "payload_off", "temperature_command_topic"] {
+                for field in [
+                    "mode_command_topic",
+                    "power_command_topic",
+                    "payload_on",
+                    "payload_off",
+                    "temperature_command_topic",
+                ] {
                     assert!(payload.get(field).is_none(), "{field}: {payload}");
                 }
                 assert!(payload.get("mode_state_topic").is_some());
