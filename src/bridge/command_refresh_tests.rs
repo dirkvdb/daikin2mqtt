@@ -300,6 +300,10 @@ impl Harness {
             if message.topic == format!("{BASE}/climate_control") {
                 climate = Some(serde_json::from_str(&message.payload).expect("parse published climate snapshot"));
             } else if message.topic == format!("{BASE}/domestic_hot_water") {
+                for topic in ["indoor_unit_hydro", "outdoor_unit", "user_interface"] {
+                    let unit = self.published.recv().await.expect("receive unit information from confirmed snapshot");
+                    assert_eq!(unit.topic, format!("{BASE}/{topic}"));
+                }
                 return climate.expect("climate snapshot precedes hot water snapshot");
             }
         }

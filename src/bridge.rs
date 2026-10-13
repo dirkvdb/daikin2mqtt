@@ -42,10 +42,52 @@ struct DomesticHotWaterTank {
     powerfull_mode: bool,
 }
 
+#[derive(Default, Serialize)]
+struct UnitInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    software_version: Option<String>,
+}
+
+impl UnitInfo {
+    fn from_management_point(mp: &Value) -> Result<Self, MqttBridgeError> {
+        Ok(Self {
+            name: parse_optional_str(&mp["name"]["value"])?,
+            model_info: parse_optional_str(&mp["modelInfo"]["value"])?,
+            software_version: parse_optional_str(&mp["softwareVersion"]["value"])?,
+        })
+    }
+}
+
 #[derive(Default)]
 struct DaikinStatus {
     climate_control: ClimateControl,
     domestic_hot_water_tank: DomesticHotWaterTank,
+    indoor_unit_hydro: Option<UnitInfo>,
+    outdoor_unit: Option<UnitInfo>,
+    user_interface: Option<UnitInfo>,
+}
+
+impl DaikinStatus {
+    fn mqtt_messages(&self, base_topic: &str) -> Result<Vec<MqttData>, MqttBridgeError> {
+        let mut messages = vec![
+            MqttData::new(format!("{}/climate_control", base_topic), to_string(&self.climate_control)?),
+            MqttData::new(format!("{}/domestic_hot_water", base_topic), to_string(&self.domestic_hot_water_tank)?),
+        ];
+        for (topic, info) in [
+            ("indoor_unit_hydro", &self.indoor_unit_hydro),
+            ("outdoor_unit", &self.outdoor_unit),
+            ("user_interface", &self.user_interface),
+        ] {
+            if let Some(info) = info {
+                messages.push(MqttData::new(format!("{}/{}", base_topic, topic), to_string(info)?));
+            }
+        }
+        Ok(messages)
+    }
 }
 
 pub struct DaikinMqttBridgeConfig {
@@ -260,18 +302,10 @@ impl DaikinMqttBridge {
             self.mqtt.publish(water_heater, true).await?;
         }
 
-        let climate_control_json = to_string(&status.climate_control)?;
-        let domestic_hot_water_tank_json = to_string(&status.domestic_hot_water_tank)?;
-        self.mqtt
-            .publish(MqttData::new(format!("{}/climate_control", self.mqtt.base_topic()), climate_control_json), true)
-            .await?;
-
-        self.mqtt
-            .publish(
-                MqttData::new(format!("{}/domestic_hot_water", self.mqtt.base_topic()), domestic_hot_water_tank_json),
-                true,
-            )
-            .await
+        for message in status.mqtt_messages(self.mqtt.base_topic())? {
+            self.mqtt.publish(message, true).await?;
+        }
+        Ok(())
     }
 
     fn process_status_json(json_string: String) -> Result<DaikinStatus, MqttBridgeError> {
@@ -314,6 +348,15 @@ impl DaikinMqttBridge {
                             )?;
                             status.domestic_hot_water_tank.powerfull_mode = parse_bool(&mp["isPowerfulModeActive"]["value"])?;
                         }
+                        "indoorUnitHydro" => {
+                            status.indoor_unit_hydro = Some(UnitInfo::from_management_point(mp)?);
+                        }
+                        "outdoorUnit" => {
+                            status.outdoor_unit = Some(UnitInfo::from_management_point(mp)?);
+                        }
+                        "userInterface" => {
+                            status.user_interface = Some(UnitInfo::from_management_point(mp)?);
+                        }
                         _ => {
                             log::info!("Ignored management point: {}", id);
                         }
@@ -349,6 +392,14 @@ fn parse_f32(value: &Value) -> Result<f32, MqttBridgeError> {
 
 fn parse_str(value: &Value) -> Result<String, MqttBridgeError> {
     value.as_str().ok_or(MqttBridgeError::ParseError).map(|v| v.to_string())
+}
+
+fn parse_optional_str(value: &Value) -> Result<Option<String>, MqttBridgeError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        parse_str(value).map(Some)
+    }
 }
 
 fn parse_bool(value: &Value) -> Result<bool, MqttBridgeError> {
@@ -412,14 +463,20 @@ mod tests {
                 )
                 .expect("water heater capabilities"),
             ];
+            let fixture = include_str!("../resources/test/managementpoints.json");
+            let status_messages = DaikinMqttBridge::process_status_json(fixture.to_owned())
+                .expect("process status fixture")
+                .mqtt_messages("test/daikin")
+                .expect("status messages");
+            assert_eq!(status_messages.len(), 5);
             let mut expected_topics = Vec::new();
             for _ in 0..2 {
-                bridge.update_heatpump_status(DaikinStatus::default()).await.expect("queue status update");
+                let status = DaikinMqttBridge::process_status_json(fixture.to_owned()).expect("process status fixture");
+                bridge.update_heatpump_status(status).await.expect("queue status update");
                 if enabled {
                     expected_topics.extend(discovery.iter().map(|data| data.topic.clone()));
                 }
-                expected_topics.push("test/daikin/climate_control".to_owned());
-                expected_topics.push("test/daikin/domestic_hot_water".to_owned());
+                expected_topics.extend(status_messages.iter().map(|data| data.topic.clone()));
             }
 
             let broker = async {
@@ -434,7 +491,7 @@ mod tests {
                             assert_eq!(publish.topic.as_ref(), topic.as_bytes());
                             assert!(publish.retain);
                             assert_eq!(publish.qos, QoS::AtLeastOnce);
-                            if let Some(data) = discovery.iter().find(|data| data.topic == topic) {
+                            if let Some(data) = discovery.iter().chain(status_messages.iter()).find(|data| data.topic == topic) {
                                 assert_eq!(publish.payload.as_ref(), data.payload.as_bytes());
                             }
                             break;
@@ -511,6 +568,88 @@ mod tests {
         let daikin_status = DaikinMqttBridge::process_status_json(json).unwrap();
         assert_eq!(daikin_status.domestic_hot_water_tank.on_off_mode, "on");
         assert_eq!(daikin_status.climate_control.room_temperature, 20.3);
+    }
+
+    #[test_log::test]
+    fn exposes_unit_information_from_both_fixtures() {
+        for fixture in ["managementpoints.json", "managementpoints2.json"] {
+            let json = std::fs::read_to_string(test_data_dir().join(fixture)).unwrap();
+            let status = DaikinMqttBridge::process_status_json(json).unwrap();
+            let messages = status.mqtt_messages("daikin").unwrap();
+
+            assert_eq!(messages.len(), 5);
+            assert_eq!(messages[0].topic, "daikin/climate_control");
+            assert_eq!(messages[1].topic, "daikin/domestic_hot_water");
+            for (topic, expected) in [
+                (
+                    "daikin/indoor_unit_hydro",
+                    serde_json::json!({
+                        "name": "Indoor Hydro Unit",
+                        "model_info": "EHVH08S23EJ9W",
+                        "software_version": "0221"
+                    }),
+                ),
+                (
+                    "daikin/outdoor_unit",
+                    serde_json::json!({
+                        "name": "Outdoor Unit",
+                        "model_info": "",
+                        "software_version": "FFFF"
+                    }),
+                ),
+                (
+                    "daikin/user_interface",
+                    serde_json::json!({
+                        "name": "User Interface",
+                        "software_version": "6.3.0"
+                    }),
+                ),
+            ] {
+                let message = messages.iter().find(|message| message.topic == topic).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&message.payload).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn absent_unit_management_points_are_not_published() {
+        let json = serde_json::json!([{"managementPoints": []}]);
+        let status = DaikinMqttBridge::process_status_json(json.to_string()).unwrap();
+        let messages = status.mqtt_messages("daikin").unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].topic, "daikin/climate_control");
+        assert_eq!(messages[1].topic, "daikin/domestic_hot_water");
+    }
+
+    #[test_log::test]
+    fn missing_unit_information_is_omitted() {
+        let json = serde_json::json!([{"managementPoints": [
+            {"embeddedId": "indoorUnitHydro"},
+            {"embeddedId": "outdoorUnit", "softwareVersion": {"value": null}},
+            {"embeddedId": "userInterface", "name": {"value": "User Interface"}}
+        ]}]);
+        let status = DaikinMqttBridge::process_status_json(json.to_string()).unwrap();
+        let messages = status.mqtt_messages("daikin").unwrap();
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(serde_json::from_str::<Value>(&messages[2].payload).unwrap(), serde_json::json!({}));
+        assert_eq!(serde_json::from_str::<Value>(&messages[3].payload).unwrap(), serde_json::json!({}));
+        assert_eq!(
+            serde_json::from_str::<Value>(&messages[4].payload).unwrap(),
+            serde_json::json!({"name": "User Interface"})
+        );
+    }
+
+    #[test_log::test]
+    fn invalid_unit_information_returns_parse_error() {
+        let json = serde_json::json!([{"managementPoints": [
+            {"embeddedId": "outdoorUnit", "modelInfo": {"value": 123}}
+        ]}]);
+        assert!(matches!(
+            DaikinMqttBridge::process_status_json(json.to_string()),
+            Err(MqttBridgeError::ParseError)
+        ));
     }
 
     use std::path::PathBuf;
