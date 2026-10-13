@@ -5,6 +5,7 @@ use crate::{mqtt::MqttData, MqttBridgeError};
 pub(crate) const CLIMATE_MODE: &str = "climate_mode";
 pub(crate) const CLIMATE_POWER: &str = "climate_power";
 pub(crate) const CLIMATE_TEMPERATURE: &str = "climate_temperature";
+pub(crate) const CLIMATE_LEAVING_WATER_OFFSET: &str = "heating_setpoint_leaving_water_offset";
 pub(crate) const WATER_MODE: &str = "domestic_hot_water_mode";
 pub(crate) const WATER_POWER: &str = "domestic_hot_water_power";
 pub(crate) const WATER_TEMPERATURE: &str = "domestic_hot_water_temperature";
@@ -70,7 +71,7 @@ fn command_kind(base: &str, topic: &str) -> Result<(bool, bool), MqttBridgeError
         .ok_or_else(|| invalid("Unknown MQTT command topic"))?;
     match command {
         CLIMATE_MODE | CLIMATE_POWER => Ok((false, false)),
-        CLIMATE_TEMPERATURE => Ok((false, true)),
+        CLIMATE_TEMPERATURE | CLIMATE_LEAVING_WATER_OFFSET => Ok((false, true)),
         WATER_MODE | WATER_POWER => Ok((true, false)),
         WATER_TEMPERATURE => Ok((true, true)),
         _ => Err(invalid("Unknown MQTT command; authentication is only available in the web UI")),
@@ -135,6 +136,13 @@ pub(crate) fn temperature_writable(devices: &Value, water: bool) -> bool {
     })
 }
 
+pub(crate) fn leaving_water_offset_writable(devices: &Value) -> bool {
+    target(devices, "climateControlMainZone").is_ok_and(|(_, point)| {
+        point["temperatureControl"]["settable"].as_bool() == Some(true)
+            && point["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]["leavingWaterOffset"]["settable"].as_bool() == Some(true)
+    })
+}
+
 pub(crate) fn updates(base: &str, message: &MqttData, devices: &Value) -> Result<Vec<CharacteristicUpdate>, MqttBridgeError> {
     let command = message
         .topic
@@ -164,16 +172,24 @@ pub(crate) fn updates(base: &str, message: &MqttData, devices: &Value) -> Result
         if !number.is_finite() {
             return Err(invalid("Temperature command must be finite"));
         }
-        let path = format!(
-            "/operationModes/heating/setpoints/{}",
-            if water { "domesticHotWaterTemperature" } else { "roomTemperature" }
-        );
+        let offset = command == CLIMATE_LEAVING_WATER_OFFSET;
+        if offset && (!(-10.0..=10.0).contains(&number) || number.fract() != 0.0) {
+            return Err(invalid("Leaving water offset must be an integer between -10 and 10"));
+        }
+        let setpoint = if offset {
+            "leavingWaterOffset"
+        } else if water {
+            "domesticHotWaterTemperature"
+        } else {
+            "roomTemperature"
+        };
+        let path = format!("/operationModes/heating/setpoints/{setpoint}");
         let control = &point["temperatureControl"];
         if control["settable"].as_bool() != Some(true) {
             return Err(invalid("Temperature control is read-only"));
         }
         let metadata = control["value"].pointer(&path).ok_or_else(|| invalid("Temperature setpoint not found"))?;
-        let value = json!(number);
+        let value = if offset { json!(number as i8) } else { json!(number) };
         validate(metadata, &value)?;
         return Ok(vec![update("temperatureControl", Some(path), value)]);
     }
@@ -223,6 +239,54 @@ pub(crate) fn updates(base: &str, message: &MqttData, devices: &Value) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaving_water_offset_commands_use_integer_values_and_nested_path() {
+        for number in -10..=10 {
+            let updates = updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, &number.to_string()), &devices()).unwrap();
+            assert_eq!(updates.len(), 1);
+            let update = &updates[0];
+            assert_eq!(update.gateway_id, devices()[0]["id"].as_str().unwrap());
+            assert_eq!(update.management_point, "climateControlMainZone");
+            assert_eq!(update.characteristic, "temperatureControl");
+            assert_eq!(update.path.as_deref(), Some("/operationModes/heating/setpoints/leavingWaterOffset"));
+            assert_eq!(update.value.as_i64(), Some(number));
+        }
+        assert!(updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, " 5.0 "), &devices()).is_ok());
+        for payload in ["-11", "11", "0.5", "NaN", "inf", "", "invalid"] {
+            assert!(
+                updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, payload), &devices()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_water_offset_commands_respect_device_capabilities() {
+        let mut snapshot = devices();
+        assert!(leaving_water_offset_writable(&snapshot));
+        for path in [
+            "/temperatureControl/settable",
+            "/temperatureControl/value/operationModes/heating/setpoints/leavingWaterOffset/settable",
+        ] {
+            let mut snapshot = devices();
+            *point(&mut snapshot, "climateControlMainZone").pointer_mut(path).unwrap() = json!(false);
+            assert!(!leaving_water_offset_writable(&snapshot));
+            assert!(updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, "5"), &snapshot).is_err());
+        }
+        point(&mut snapshot, "climateControlMainZone")["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
+            .as_object_mut()
+            .unwrap()
+            .remove("leavingWaterOffset");
+        assert!(!leaving_water_offset_writable(&snapshot));
+        assert!(updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, "5"), &snapshot).is_err());
+        assert!(updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, "5"), &json!([])).is_err());
+        let mut snapshot = devices();
+        let duplicate = snapshot[0].clone();
+        snapshot.as_array_mut().unwrap().push(duplicate);
+        assert!(!leaving_water_offset_writable(&snapshot));
+        assert!(updates("home/daikin", &message(CLIMATE_LEAVING_WATER_OFFSET, "5"), &snapshot).is_err());
+    }
 
     fn devices() -> Value {
         serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture")

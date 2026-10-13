@@ -334,6 +334,8 @@ impl DaikinMqttBridge {
             )?;
             self.mqtt.publish(climate, true).await?;
             self.mqtt.publish(water_heater, true).await?;
+            let offset = hassdiscovery::leaving_water_offset_topic(self.mqtt.base_topic(), &self.devices)?;
+            self.mqtt.publish(offset, true).await?;
         }
 
         for message in status.mqtt_messages(self.mqtt.base_topic())? {
@@ -499,6 +501,7 @@ mod tests {
                     true,
                 )
                 .expect("water heater capabilities"),
+                hassdiscovery::leaving_water_offset_topic("test/daikin", &bridge.devices).expect("offset discovery data"),
             ];
             let fixture = include_str!("../resources/test/managementpoints.json");
             let status_messages = DaikinMqttBridge::process_status_json(fixture.to_owned())

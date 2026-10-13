@@ -144,6 +144,34 @@ pub fn domestic_hot_water_topic(base_topic: &str) -> Result<MqttData, MqttBridge
     Ok(MqttData::new(topic, serde_json::to_string(&water_heater)?))
 }
 
+pub fn leaving_water_offset_topic(base_topic: &str, devices: &serde_json::Value) -> Result<MqttData, MqttBridgeError> {
+    let device_id = device_id(base_topic);
+    let unique_id = format!("{device_id}_heating_setpoint_leaving_water_offset");
+    let topic = format!("{HASS_DISCOVERY_TOPIC}/number/{unique_id}/config");
+    if !commands::leaving_water_offset_writable(devices) {
+        // Clear retained discovery if the setting is no longer available or writable.
+        return Ok(MqttData::new(topic, String::new()));
+    }
+    let payload = serde_json::json!({
+        "origin": Origin::daikin2mqtt(),
+        "device": Device::heat_pump(device_id),
+        "name": "Heating setpoint leaving water offset",
+        "unique_id": unique_id,
+        "availability_topic": format!("{base_topic}/state"),
+        "state_topic": format!("{base_topic}/climate_control"),
+        "value_template": "{{ value_json.heating_setpoint_leaving_water_offset }}",
+        "command_topic": commands::topic(base_topic, commands::CLIMATE_LEAVING_WATER_OFFSET),
+        "min": -10,
+        "max": 10,
+        "step": 1,
+        "mode": "box",
+        "unit_of_measurement": "°C",
+        "qos": 1,
+        "retain": false,
+    });
+    Ok(MqttData::new(topic, serde_json::to_string(&payload)?))
+}
+
 pub(crate) fn with_temperature_metadata(mut data: MqttData, metadata: Option<&serde_json::Value>) -> Result<MqttData, MqttBridgeError> {
     if let Some(metadata) = metadata {
         let mut payload: serde_json::Value = serde_json::from_str(&data.payload)?;
@@ -201,6 +229,48 @@ pub(crate) fn with_device_capabilities(data: MqttData, base_topic: &str, devices
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn leaving_water_offset_discovery_exposes_writable_integer_control() {
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).unwrap();
+        let data = leaving_water_offset_topic("house/daikin", &devices).unwrap();
+        let payload: Value = serde_json::from_str(&data.payload).unwrap();
+        assert_eq!(data.topic, format!("homeassistant/number/{}/config", payload["unique_id"].as_str().unwrap()));
+        assert_eq!(payload["min"], -10);
+        assert_eq!(payload["max"], 10);
+        assert_eq!(payload["step"], 1);
+        assert_eq!(payload["state_topic"], "house/daikin/climate_control");
+        assert_eq!(payload["value_template"], "{{ value_json.heating_setpoint_leaving_water_offset }}");
+        assert_eq!(payload["availability_topic"], "house/daikin/state");
+        assert_eq!(payload["retain"], false);
+        let climate: Value = serde_json::from_str(&climate_control_topic("house/daikin").unwrap().payload).unwrap();
+        assert_eq!(payload["device"], climate["device"]);
+        assert_eq!(payload["origin"], climate["origin"]);
+        assert_ne!(payload["unique_id"], climate["unique_id"]);
+        for value in ["-10", "0", "10"] {
+            let message = MqttData::new(payload["command_topic"].as_str().unwrap().into(), value.into());
+            assert!(commands::updates("house/daikin", &message, &devices).is_ok());
+        }
+        assert_eq!(data.payload, leaving_water_offset_topic("house/daikin", &devices).unwrap().payload);
+        assert_ne!(data.topic, leaving_water_offset_topic("house_daikin", &devices).unwrap().topic);
+    }
+
+    #[test]
+    fn leaving_water_offset_discovery_clears_unavailable_controls() {
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).unwrap();
+        let mut read_only = devices.clone();
+        point(&mut read_only, false)["temperatureControl"]["settable"] = json!(false);
+        let mut missing = devices.clone();
+        point(&mut missing, false)["temperatureControl"]["value"]["operationModes"]["heating"]["setpoints"]
+            .as_object_mut()
+            .unwrap()
+            .remove("leavingWaterOffset");
+        let mut ambiguous = devices.clone();
+        ambiguous.as_array_mut().unwrap().push(devices[0].clone());
+        for snapshot in [read_only, missing, ambiguous, json!([])] {
+            assert!(leaving_water_offset_topic("house/daikin", &snapshot).unwrap().payload.is_empty());
+        }
+    }
 
     fn configured_discovery(devices: &Value, water: bool) -> Value {
         let data = if water {
