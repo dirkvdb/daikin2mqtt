@@ -62,6 +62,36 @@ impl UnitInfo {
     }
 }
 
+#[derive(Default, Serialize)]
+struct GatewayInfo {
+    #[serde(flatten)]
+    unit_info: UnitInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firmware_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mac_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_firmware_update_supported: Option<bool>,
+}
+
+impl GatewayInfo {
+    fn from_management_point(mp: &Value) -> Result<Self, MqttBridgeError> {
+        Ok(Self {
+            unit_info: UnitInfo::from_management_point(mp)?,
+            firmware_version: parse_optional_str(&mp["firmwareVersion"]["value"])?,
+            ip_address: parse_optional_str(&mp["ipAddress"]["value"])?,
+            mac_address: parse_optional_str(&mp["macAddress"]["value"])?,
+            is_firmware_update_supported: if mp["isFirmwareUpdateSupported"]["value"].is_null() {
+                None
+            } else {
+                Some(parse_bool(&mp["isFirmwareUpdateSupported"]["value"])?)
+            },
+        })
+    }
+}
+
 #[derive(Default)]
 struct DaikinStatus {
     climate_control: ClimateControl,
@@ -69,6 +99,7 @@ struct DaikinStatus {
     indoor_unit_hydro: Option<UnitInfo>,
     outdoor_unit: Option<UnitInfo>,
     user_interface: Option<UnitInfo>,
+    gateway: Option<GatewayInfo>,
 }
 
 impl DaikinStatus {
@@ -85,6 +116,9 @@ impl DaikinStatus {
             if let Some(info) = info {
                 messages.push(MqttData::new(format!("{}/{}", base_topic, topic), to_string(info)?));
             }
+        }
+        if let Some(gateway) = &self.gateway {
+            messages.push(MqttData::new(format!("{}/gateway", base_topic), to_string(gateway)?));
         }
         Ok(messages)
     }
@@ -321,6 +355,9 @@ impl DaikinMqttBridge {
                 if let Some(id) = mp["embeddedId"].as_str() {
                     log::debug!("Management point: {}", id);
                     match id {
+                        "gateway" => {
+                            status.gateway = Some(GatewayInfo::from_management_point(mp)?);
+                        }
                         "climateControlMainZone" => {
                             log::info!("climateControlMainZone");
                             status.climate_control.holiday_mode_active = parse_bool(&mp["isHolidayModeActive"]["value"])?;
@@ -468,7 +505,7 @@ mod tests {
                 .expect("process status fixture")
                 .mqtt_messages("test/daikin")
                 .expect("status messages");
-            assert_eq!(status_messages.len(), 5);
+            assert_eq!(status_messages.len(), 6);
             let mut expected_topics = Vec::new();
             for _ in 0..2 {
                 let status = DaikinMqttBridge::process_status_json(fixture.to_owned()).expect("process status fixture");
@@ -577,7 +614,7 @@ mod tests {
             let status = DaikinMqttBridge::process_status_json(json).unwrap();
             let messages = status.mqtt_messages("daikin").unwrap();
 
-            assert_eq!(messages.len(), 5);
+            assert_eq!(messages.len(), 6);
             assert_eq!(messages[0].topic, "daikin/climate_control");
             assert_eq!(messages[1].topic, "daikin/domestic_hot_water");
             for (topic, expected) in [
@@ -608,6 +645,68 @@ mod tests {
                 let message = messages.iter().find(|message| message.topic == topic).unwrap();
                 assert_eq!(serde_json::from_str::<Value>(&message.payload).unwrap(), expected);
             }
+        }
+    }
+
+    #[test_log::test]
+    fn exposes_gateway_information_from_both_fixtures() {
+        for (fixture, mac_address) in [("managementpoints.json", "20:4e:f6:a6:00:00"), ("managementpoints2.json", "20:4e:f6:a6:d8:9a")] {
+            let json = std::fs::read_to_string(test_data_dir().join(fixture)).expect("read fixture");
+            let status = DaikinMqttBridge::process_status_json(json).expect("process fixture");
+            let messages = status.mqtt_messages("daikin").expect("status messages");
+            let gateway = messages.iter().find(|message| message.topic == "daikin/gateway").expect("gateway message");
+            assert_eq!(
+                serde_json::from_str::<Value>(&gateway.payload).expect("gateway JSON"),
+                serde_json::json!({
+                    "name": "Gateway",
+                    "model_info": "BRP069A78",
+                    "firmware_version": "3.2.5",
+                    "ip_address": "192.168.1.176",
+                    "mac_address": mac_address,
+                    "is_firmware_update_supported": true
+                })
+            );
+        }
+    }
+
+    #[test_log::test]
+    fn missing_gateway_information_is_omitted_and_false_is_preserved() {
+        for (point, expected) in [
+            (serde_json::json!({"embeddedId": "gateway"}), serde_json::json!({})),
+            (
+                serde_json::json!({
+                    "embeddedId": "gateway",
+                    "firmwareVersion": {"value": null},
+                    "ipAddress": {"value": ""},
+                    "isFirmwareUpdateSupported": {"value": false}
+                }),
+                serde_json::json!({"ip_address": "", "is_firmware_update_supported": false}),
+            ),
+            (
+                serde_json::json!({"embeddedId": "gateway", "isFirmwareUpdateSupported": {"value": null}}),
+                serde_json::json!({}),
+            ),
+        ] {
+            let json = serde_json::json!([{"managementPoints": [point]}]);
+            let status = DaikinMqttBridge::process_status_json(json.to_string()).expect("process gateway");
+            let messages = status.mqtt_messages("daikin").expect("status messages");
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[2].topic, "daikin/gateway");
+            assert_eq!(serde_json::from_str::<Value>(&messages[2].payload).expect("gateway JSON"), expected);
+        }
+    }
+
+    #[test_log::test]
+    fn invalid_gateway_information_returns_parse_error() {
+        for point in [
+            serde_json::json!({"embeddedId": "gateway", "firmwareVersion": {"value": 123}}),
+            serde_json::json!({"embeddedId": "gateway", "isFirmwareUpdateSupported": {"value": "false"}}),
+        ] {
+            let json = serde_json::json!([{"managementPoints": [point]}]);
+            assert!(matches!(
+                DaikinMqttBridge::process_status_json(json.to_string()),
+                Err(MqttBridgeError::ParseError)
+            ));
         }
     }
 
