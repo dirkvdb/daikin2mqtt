@@ -1,4 +1,11 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use rumqttc::{
     tokio_rustls::rustls::{
@@ -8,7 +15,7 @@ use rumqttc::{
         pki_types::{CertificateDer, ServerName, UnixTime},
         ClientConfig, DigitallySignedStruct, SignatureScheme,
     },
-    Transport,
+    Outgoing, Transport,
 };
 
 use rumqttc::v5::{
@@ -116,6 +123,13 @@ pub struct MqttConnection {
     client: AsyncClient,
     eventloop: EventLoop,
     base_topic: String,
+    connected: Arc<AtomicBool>,
+}
+
+impl Drop for MqttConnection {
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::Relaxed);
+    }
 }
 
 fn from_mqtt_string(stream: &bytes::Bytes) -> Result<String, MqttBridgeError> {
@@ -153,6 +167,7 @@ impl MqttConnection {
             client,
             eventloop,
             base_topic: cfg.base_topic,
+            connected: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -160,11 +175,16 @@ impl MqttConnection {
         match self.eventloop.poll().await {
             Ok(msg) => self.handle_mqtt_message(msg).await,
             Err(err) => {
+                self.connected.store(false, Ordering::Relaxed);
                 let (broker, port) = self.eventloop.options.broker_address();
                 log::warn!("MQTT connection error: broker={broker:?}, port={port}, error={err}");
                 Err(err.into())
             }
         }
+    }
+
+    pub(crate) fn connection_status(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connected)
     }
 
     pub fn base_topic(&self) -> &String {
@@ -201,6 +221,7 @@ impl MqttConnection {
         match ev {
             Event::Incoming(event) => match event {
                 Packet::ConnAck(data) => {
+                    self.connected.store(data.code == ConnectReturnCode::Success, Ordering::Relaxed);
                     if data.code == ConnectReturnCode::Success {
                         let (broker, port) = self.eventloop.options.broker_address();
                         log::info!(
@@ -232,6 +253,9 @@ impl MqttConnection {
                         payload: from_mqtt_string(&publ.payload)?,
                     }));
                 }
+                Packet::Disconnect(_) => {
+                    self.connected.store(false, Ordering::Relaxed);
+                }
                 //Packet::Connect(_) => todo!(),
                 // Packet::PubAck(_) => todo!(),
                 // Packet::PubRec(_) => todo!(),
@@ -243,9 +267,11 @@ impl MqttConnection {
                 // Packet::UnsubAck(_) => todo!(),
                 // Packet::PingReq => todo!(),
                 // Packet::PingResp => todo!(),
-                // Packet::Disconnect => todo!(),
                 _ => {}
             },
+            Event::Outgoing(Outgoing::Disconnect) => {
+                self.connected.store(false, Ordering::Relaxed);
+            }
             _ => {}
         }
 
@@ -271,6 +297,86 @@ mod tests {
             password: String::new(),
             base_topic: "daikin".into(),
         }
+    }
+
+    fn incoming(packet: &[u8]) -> Event {
+        Event::Incoming(Packet::read(&mut BytesMut::from(packet), None).expect("MQTT packet"))
+    }
+
+    #[test]
+    fn connection_status_is_initially_false_and_shared() {
+        let mqtt = MqttConnection::new(config()).expect("create MQTT connection");
+        let status = mqtt.connection_status();
+        assert!(!status.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&status, &mqtt.connection_status()));
+    }
+
+    #[tokio::test]
+    async fn connection_status_tracks_successful_and_refused_connacks() {
+        let mut mqtt = MqttConnection::new(config()).expect("create MQTT connection");
+        let status = mqtt.connection_status();
+        for (session_present, code, connected) in [(0, 0, true), (0, 0x87, false), (1, 0, true)] {
+            mqtt.handle_mqtt_message(incoming(&[0x20, 0x03, session_present, code, 0x00]))
+                .await
+                .expect("handle CONNACK");
+            assert_eq!(status.load(Ordering::Relaxed), connected);
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_status_clears_on_incoming_and_outgoing_disconnect() {
+        let mut mqtt = MqttConnection::new(config()).expect("create MQTT connection");
+        let status = mqtt.connection_status();
+        for event in [incoming(&[0xe0, 0x02, 0x00, 0x00]), Event::Outgoing(Outgoing::Disconnect)] {
+            mqtt.handle_mqtt_message(incoming(&[0x20, 0x03, 0x00, 0x00, 0x00]))
+                .await
+                .expect("handle CONNACK");
+            assert!(status.load(Ordering::Relaxed));
+            mqtt.handle_mqtt_message(event).await.expect("handle disconnect");
+            assert!(!status.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_status_clears_on_poll_error() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind test broker");
+        let mut mqtt = MqttConnection::new(MqttConfig {
+            server: "127.0.0.1".into(),
+            port: listener.local_addr().expect("broker address").port(),
+            ..config()
+        })
+        .expect("create MQTT connection");
+        let status = mqtt.connection_status();
+        mqtt.handle_mqtt_message(incoming(&[0x20, 0x03, 0x00, 0x00, 0x00]))
+            .await
+            .expect("handle CONNACK");
+        assert!(status.load(Ordering::Relaxed));
+
+        let (_, result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let (stream, _) = listener.accept().await.expect("accept MQTT connection");
+                    drop(stream);
+                },
+                mqtt.poll()
+            )
+        })
+        .await
+        .expect("poll must finish after broker closes connection");
+        assert!(result.is_err());
+        assert!(!status.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn connection_status_clears_when_connection_is_dropped() {
+        let mut mqtt = MqttConnection::new(config()).expect("create MQTT connection");
+        let status = mqtt.connection_status();
+        mqtt.handle_mqtt_message(incoming(&[0x20, 0x03, 0x00, 0x00, 0x00]))
+            .await
+            .expect("handle CONNACK");
+        assert!(status.load(Ordering::Relaxed));
+        drop(mqtt);
+        assert!(!status.load(Ordering::Relaxed));
     }
 
     #[test]

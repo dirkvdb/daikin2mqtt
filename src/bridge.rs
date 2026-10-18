@@ -172,14 +172,23 @@ impl DaikinMqttBridge {
     }
 
     pub async fn run(self) -> Result<(), MqttBridgeError> {
-        let connection = Arc::new(Mutex::new(DaikinCloudConnection::new(
+        let connection = DaikinCloudConnection::new(
             self.cloud_client_id.clone(),
             self.cloud_client_secret.clone(),
             self.cloud_redirect_uri.clone(),
             &self.data_dir,
-        )?));
+        )?;
+        let cloud_connected = connection.connection_status();
+        let connection = Arc::new(Mutex::new(connection));
         let refresh = Arc::new(Notify::new());
-        let web_state = web::WebState::new(connection.clone(), refresh.clone(), self.cloud_redirect_uri.clone(), self.web_listen)?;
+        let web_state = web::WebState::new(
+            connection.clone(),
+            cloud_connected,
+            self.mqtt.connection_status(),
+            refresh.clone(),
+            self.cloud_redirect_uri.clone(),
+            self.web_listen,
+        )?;
         let listener = tokio::net::TcpListener::bind(self.web_listen).await?;
         log::info!("Authentication UI listening on http://{}", listener.local_addr()?);
         log::info!("Registered OAuth callback: {}", self.cloud_redirect_uri);

@@ -30,6 +30,20 @@ The Docker image declares `EXPOSE 8076`, but this does not publish the port. The
 
 **Security:** Exposing the web UI grants administrative access to authorization and revocation. The bridge has no web login. Restrict it to a trusted network or protect it with reverse-proxy authentication and TLS. Never expose it publicly without protection. The server checks request hosts and CSRF tokens on administrative actions; reverse proxies must preserve the browser's `Host` header (matching the configured callback host). Responses disable caching and referrer forwarding, and enforce a self-only content security policy.
 
+### Health check
+
+`GET /api/health` on the same web server returns plain-text `ok` with HTTP **200** only when both the Daikin cloud connection and MQTT broker connection are established. Otherwise it returns plain-text `unavailable` with HTTP **503**, including during startup before either connection is established.
+
+Cloud health reflects the most recent cloud device poll or command result; failed API requests or authorization revocation mark it unhealthy until a successful API request. MQTT health follows broker connection acknowledgments, disconnects, and connection errors. Health checks use cached connection state without making additional cloud requests or waiting for an in-progress cloud request, so they do not consume Daikin API quota. Outages are reflected when the normal cloud polling or MQTT event loop detects them.
+
+For a local probe using the default port:
+
+```sh
+curl --fail http://127.0.0.1:8076/api/health
+```
+
+The existing host validation also applies to this endpoint; use the configured callback host or an accepted local listen address.
+
 ### Secrets via SecretSpec
 
 The application uses the SecretSpec Rust SDK to resolve credentials from the declarations in `secretspec.toml` before starting the bridge. The manifest is embedded at build time, so installed binaries and Docker containers do not need a runtime copy. Changing the declarations requires rebuilding the application; secret values are never embedded.

@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -21,6 +27,8 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct WebState {
     connection: Arc<Mutex<DaikinCloudConnection>>,
+    cloud_connected: Arc<AtomicBool>,
+    mqtt_connected: Arc<AtomicBool>,
     refresh: Arc<Notify>,
     redirect_uri: String,
     csrf_token: CsrfToken,
@@ -30,6 +38,8 @@ pub(crate) struct WebState {
 impl WebState {
     pub(crate) fn new(
         connection: Arc<Mutex<DaikinCloudConnection>>,
+        cloud_connected: Arc<AtomicBool>,
+        mqtt_connected: Arc<AtomicBool>,
         refresh: Arc<Notify>,
         redirect_uri: String,
         listen: SocketAddr,
@@ -67,6 +77,8 @@ impl WebState {
         }
         Ok(Self {
             connection,
+            cloud_connected,
+            mqtt_connected,
             refresh,
             redirect_uri,
             csrf_token: CsrfToken::new_random(),
@@ -97,6 +109,7 @@ pub(crate) fn router(state: WebState) -> Router {
                 )
             }),
         )
+        .route("/api/health", get(health))
         .route("/api/auth/status", get(status))
         .route("/api/auth/start", post(start))
         .route("/api/auth/revoke", post(revoke))
@@ -155,6 +168,14 @@ fn valid_csrf(state: &WebState, request: &Request) -> bool {
         }
     }
     true
+}
+
+async fn health(State(state): State<WebState>) -> (StatusCode, &'static str) {
+    if state.cloud_connected.load(Ordering::Relaxed) && state.mqtt_connected.load(Ordering::Relaxed) {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    }
 }
 
 #[derive(Serialize)]
@@ -231,6 +252,7 @@ mod tests {
     use super::*;
 
     struct Server {
+        state: WebState,
         address: SocketAddr,
         task: tokio::task::JoinHandle<()>,
         _directory: tempfile::TempDir,
@@ -243,9 +265,19 @@ mod tests {
             let address = listener.local_addr().expect("get test address");
             let redirect = format!("http://{address}/oauth/callback");
             let connection = DaikinCloudConnection::new("client".into(), "secret".into(), redirect.clone(), directory.path()).expect("create connection");
-            let state = WebState::new(Arc::new(Mutex::new(connection)), Arc::new(Notify::new()), redirect, address).expect("create web state");
-            let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.expect("serve test UI") });
+            let state = WebState::new(
+                Arc::new(Mutex::new(connection)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Notify::new()),
+                redirect,
+                address,
+            )
+            .expect("create web state");
+            let app = router(state.clone());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve test UI") });
             Self {
+                state,
                 address,
                 task,
                 _directory: directory,
@@ -260,6 +292,29 @@ mod tests {
     impl Drop for Server {
         fn drop(&mut self) {
             self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn health_requires_both_connections_and_does_not_wait_for_cloud_lock() {
+        let server = Server::new().await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("create HTTP client");
+        let _cloud = server.state.connection.lock().await;
+        for (cloud, mqtt) in [(false, false), (true, false), (false, true), (true, true), (true, false), (false, true)] {
+            server.state.cloud_connected.store(cloud, Ordering::Relaxed);
+            server.state.mqtt_connected.store(mqtt, Ordering::Relaxed);
+            let response = client.get(server.url("/api/health")).send().await.expect("fetch health while cloud is busy");
+            let (status, body) = if cloud && mqtt {
+                (StatusCode::OK, "ok")
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+            };
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.text().await.expect("read health"), body);
         }
     }
 
@@ -382,6 +437,8 @@ mod tests {
         let connection = DaikinCloudConnection::new("client".into(), "secret".into(), redirect.into(), directory.path()).expect("create connection");
         let state = WebState::new(
             Arc::new(Mutex::new(connection)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(Notify::new()),
             redirect.into(),
             "127.0.0.1:80".parse().expect("listen address"),
@@ -426,6 +483,8 @@ mod tests {
             assert!(
                 WebState::new(
                     Arc::new(Mutex::new(connection)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(Notify::new()),
                     redirect.into(),
                     "127.0.0.1:8076".parse().expect("listen address")

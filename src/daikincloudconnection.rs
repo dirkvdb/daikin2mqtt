@@ -2,6 +2,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -67,6 +71,7 @@ pub struct DaikinCloudConnection {
     pending_code: Option<PendingCode>,
     persistence_pending: bool,
     deletion_pending: bool,
+    connected: Arc<AtomicBool>,
 }
 
 impl DaikinCloudConnection {
@@ -107,6 +112,7 @@ impl DaikinCloudConnection {
             pending_code: None,
             persistence_pending: false,
             deletion_pending: false,
+            connected: Arc::new(AtomicBool::new(false)),
         };
         // Migrate legacy files, remove saved single-use codes, and enforce private file permissions.
         if connection.authentication_data.token.is_some() {
@@ -129,6 +135,10 @@ impl DaikinCloudConnection {
             PendingAuthorization { url, state, verifier }
         });
         pending.url.clone()
+    }
+
+    pub(crate) fn connection_status(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connected)
     }
 
     pub(crate) fn authentication_state(&self) -> AuthenticationState {
@@ -245,24 +255,29 @@ impl DaikinCloudConnection {
     }
 
     pub async fn update(&mut self) -> Result<String, MqttBridgeError> {
-        self.prepare_authentication().await?;
-        let response = self.gateway_devices().await?;
-        let response = if response.status() == StatusCode::UNAUTHORIZED {
-            self.refresh_access_token().await?;
-            self.gateway_devices().await?
-        } else {
+        let result = async {
+            self.prepare_authentication().await?;
+            let response = self.gateway_devices().await?;
+            let response = if response.status() == StatusCode::UNAUTHORIZED {
+                self.refresh_access_token().await?;
+                self.gateway_devices().await?
+            } else {
+                response
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(self.authorization_required()?);
+            }
+            if !response.status().is_success() {
+                return Err(MqttBridgeError::NetworkError(format!("Gateway device request failed: {}", response.status())));
+            }
             response
-        };
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(self.authorization_required()?);
+                .text()
+                .await
+                .map_err(|_| MqttBridgeError::NetworkError("Failed to read gateway devices".into()))
         }
-        if !response.status().is_success() {
-            return Err(MqttBridgeError::NetworkError(format!("Gateway device request failed: {}", response.status())));
-        }
-        response
-            .text()
-            .await
-            .map_err(|_| MqttBridgeError::NetworkError("Failed to read gateway devices".into()))
+        .await;
+        self.connected.store(result.is_ok(), Ordering::Relaxed);
+        result
     }
 
     pub(crate) async fn set_characteristic(
@@ -273,46 +288,51 @@ impl DaikinCloudConnection {
         path: Option<&str>,
         value: &serde_json::Value,
     ) -> Result<(), MqttBridgeError> {
-        self.prepare_authentication().await?;
-        // URL path builders normalize dot-only segments instead of encoding them.
-        if [gateway_id, management_point, characteristic]
-            .iter()
-            .any(|segment| matches!(*segment, "." | ".."))
-        {
-            return Err(MqttBridgeError::RuntimeError(
-                "Characteristic endpoint must not contain dot-only path segments".into(),
-            ));
+        let result = async {
+            self.prepare_authentication().await?;
+            // URL path builders normalize dot-only segments instead of encoding them.
+            if [gateway_id, management_point, characteristic]
+                .iter()
+                .any(|segment| matches!(*segment, "." | ".."))
+            {
+                return Err(MqttBridgeError::RuntimeError(
+                    "Characteristic endpoint must not contain dot-only path segments".into(),
+                ));
+            }
+            let mut url = Url::parse(&self.api).map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?;
+            url.path_segments_mut()
+                .map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?
+                .pop_if_empty()
+                .extend([
+                    "gateway-devices",
+                    gateway_id,
+                    "management-points",
+                    management_point,
+                    "characteristics",
+                    characteristic,
+                ]);
+            let mut body = serde_json::json!({ "value": value });
+            if let Some(path) = path {
+                body["path"] = path.into();
+            }
+            let response = self.patch_characteristic(&url, &body).await?;
+            let response = if response.status() == StatusCode::UNAUTHORIZED {
+                self.refresh_access_token().await?;
+                self.patch_characteristic(&url, &body).await?
+            } else {
+                response
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(self.authorization_required()?);
+            }
+            if !response.status().is_success() {
+                return Err(MqttBridgeError::NetworkError(format!("Characteristic update failed: {}", response.status())));
+            }
+            Ok(())
         }
-        let mut url = Url::parse(&self.api).map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?;
-        url.path_segments_mut()
-            .map_err(|_| MqttBridgeError::RuntimeError("Invalid cloud API endpoint".into()))?
-            .pop_if_empty()
-            .extend([
-                "gateway-devices",
-                gateway_id,
-                "management-points",
-                management_point,
-                "characteristics",
-                characteristic,
-            ]);
-        let mut body = serde_json::json!({ "value": value });
-        if let Some(path) = path {
-            body["path"] = path.into();
-        }
-        let response = self.patch_characteristic(&url, &body).await?;
-        let response = if response.status() == StatusCode::UNAUTHORIZED {
-            self.refresh_access_token().await?;
-            self.patch_characteristic(&url, &body).await?
-        } else {
-            response
-        };
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(self.authorization_required()?);
-        }
-        if !response.status().is_success() {
-            return Err(MqttBridgeError::NetworkError(format!("Characteristic update failed: {}", response.status())));
-        }
-        Ok(())
+        .await;
+        self.connected.store(result.is_ok(), Ordering::Relaxed);
+        result
     }
 
     async fn patch_characteristic(&self, url: &Url, body: &serde_json::Value) -> Result<reqwest::Response, MqttBridgeError> {
@@ -381,6 +401,7 @@ impl DaikinCloudConnection {
     }
 
     pub async fn revoke_authorization(&mut self) -> Result<(), MqttBridgeError> {
+        self.connected.store(false, Ordering::Relaxed);
         if self.authentication_data.token.is_some() {
             // Persist intent before contacting the provider so restarts cannot resume a
             // partly revoked integration or rotate away credentials needed for retry.
@@ -467,6 +488,7 @@ impl DaikinCloudConnection {
     }
 
     fn clear_authentication_data(&mut self) -> Result<(), MqttBridgeError> {
+        self.connected.store(false, Ordering::Relaxed);
         self.authentication_data = AuthenticationData::default();
         self.pending_code = None;
         self.pending_authorization = None;

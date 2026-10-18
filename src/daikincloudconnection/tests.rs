@@ -493,6 +493,62 @@ fn callbacks_require_pending_authorization_and_cannot_be_replayed() {
 }
 
 #[tokio::test]
+async fn cloud_health_tracks_api_failures_recovery_and_revocation() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![
+        MockResponse::devices(),
+        MockResponse::unavailable(),
+        MockResponse::devices(),
+        MockResponse::unavailable(),
+        MockResponse::json(204, ""),
+        MockResponse::unavailable(),
+        MockResponse::success(),
+    ]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let connected = connection.connection_status();
+    assert!(!connected.load(Ordering::Relaxed), "saved tokens alone do not prove connectivity");
+    connection.update().await.expect("establish cloud connection");
+    assert!(connected.load(Ordering::Relaxed));
+    assert!(connection.update().await.is_err());
+    assert!(!connected.load(Ordering::Relaxed));
+    connection.update().await.expect("recover cloud connection");
+    assert!(connected.load(Ordering::Relaxed));
+    assert!(connection
+        .set_characteristic("test-gateway", "climateControl", "operationMode", None, &"heating".into())
+        .await
+        .is_err());
+    assert!(!connected.load(Ordering::Relaxed));
+    connection
+        .set_characteristic("test-gateway", "climateControl", "operationMode", None, &"heating".into())
+        .await
+        .expect("recover with cloud command");
+    assert!(connected.load(Ordering::Relaxed));
+    assert!(connection.revoke_authorization().await.is_err());
+    assert!(
+        !connected.load(Ordering::Relaxed),
+        "revocation intent makes the connection unhealthy even on failure"
+    );
+    server.finish();
+}
+
+#[tokio::test]
+async fn cloud_health_is_false_when_authorization_is_lost() {
+    let directory = TempDirectory::new();
+    directory.seed_token("stored-access", Some("stored-refresh"), now() + 7200);
+    let server = MockServer::new(vec![MockResponse::devices(), MockResponse::unauthorized(), MockResponse::invalid_grant()]);
+    let mut connection = connection(&directory);
+    use_mock(&mut connection, &server);
+    let connected = connection.connection_status();
+    connection.update().await.expect("establish cloud connection");
+    assert!(connected.load(Ordering::Relaxed));
+    assert!(matches!(connection.update().await, Err(MqttBridgeError::AuthorizationRequired(_))));
+    assert!(!connected.load(Ordering::Relaxed));
+    server.finish();
+}
+
+#[tokio::test]
 async fn unauthenticated_update_returns_the_cached_authorization_url() {
     let directory = TempDirectory::new();
     let mut connection = connection(&directory);
@@ -1657,7 +1713,15 @@ async fn web_callback_completes_authorization_and_revokes_without_mqtt() {
     use_mock(&mut connection, &provider);
     let connection = Arc::new(Mutex::new(connection));
     let refresh = Arc::new(Notify::new());
-    let web_state = crate::web::WebState::new(connection.clone(), refresh.clone(), redirect.clone(), address).expect("create web state");
+    let web_state = crate::web::WebState::new(
+        connection.clone(),
+        connection.lock().await.connection_status(),
+        Arc::new(AtomicBool::new(false)),
+        refresh.clone(),
+        redirect.clone(),
+        address,
+    )
+    .expect("create web state");
     let task = tokio::spawn(async move {
         axum::serve(listener, crate::web::router(web_state)).await.expect("serve web UI");
     });
