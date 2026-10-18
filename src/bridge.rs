@@ -155,9 +155,9 @@ pub struct DaikinMqttBridge {
 }
 
 impl DaikinMqttBridge {
-    pub fn new(cfg: DaikinMqttBridgeConfig) -> DaikinMqttBridge {
-        DaikinMqttBridge {
-            mqtt: MqttConnection::new(cfg.mqtt_config),
+    pub fn new(cfg: DaikinMqttBridgeConfig) -> Result<DaikinMqttBridge, MqttBridgeError> {
+        Ok(DaikinMqttBridge {
+            mqtt: MqttConnection::new(cfg.mqtt_config)?,
             cloud_client_id: cfg.cloud_client_id,
             cloud_client_secret: cfg.cloud_client_secret,
             cloud_redirect_uri: cfg.cloud_redirect_uri,
@@ -168,7 +168,7 @@ impl DaikinMqttBridge {
             status: MqttStatus::default(),
             devices: Value::Null,
             command_refresh_deadline: None,
-        }
+        })
     }
 
     pub async fn run(self) -> Result<(), MqttBridgeError> {
@@ -472,6 +472,8 @@ mod tests {
                 mqtt_config: MqttConfig {
                     server: "127.0.0.1".to_owned(),
                     port: listener.local_addr().expect("broker address").port(),
+                    ca_cert: None,
+                    insecure: false,
                     client_id: "discovery-test".to_owned(),
                     user: String::new(),
                     password: String::new(),
@@ -484,7 +486,8 @@ mod tests {
                 hass_discovery: enabled,
                 poll_interval: time::Duration::from_secs(600),
                 data_dir: PathBuf::new(),
-            });
+            })
+            .expect("create test bridge");
             bridge.devices = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
             let discovery = [
                 hassdiscovery::with_device_capabilities(

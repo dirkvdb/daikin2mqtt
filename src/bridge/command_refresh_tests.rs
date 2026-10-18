@@ -200,6 +200,8 @@ impl Harness {
             mqtt_config: MqttConfig {
                 server: "127.0.0.1".into(),
                 port,
+                ca_cert: None,
+                insecure: false,
                 client_id: "command-refresh-test".into(),
                 user: String::new(),
                 password: String::new(),
@@ -212,7 +214,8 @@ impl Harness {
             hass_discovery: false,
             poll_interval,
             data_dir: data_dir.path().to_owned(),
-        });
+        })
+        .expect("create test bridge");
         let mut connection = DaikinCloudConnection::new(
             "test-client".into(),
             "test-secret".into(),

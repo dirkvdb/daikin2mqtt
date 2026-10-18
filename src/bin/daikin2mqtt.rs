@@ -38,6 +38,14 @@ struct Opt {
     #[clap(long = "mqtt-port", env = "DAIKIN_MQTT_PORT", default_value_t = 1883)]
     mqtt_port: u16,
 
+    /// Enable MQTT TLS using a PEM CA certificate file
+    #[clap(long = "mqtt-ca-cert", env = "DAIKIN_MQTT_CA_CERT", conflicts_with = "mqtt_insecure")]
+    mqtt_ca_cert: Option<PathBuf>,
+
+    /// Enable MQTT TLS without validating the server certificate (insecure)
+    #[clap(long = "mqtt-insecure", env = "DAIKIN_MQTT_INSECURE")]
+    mqtt_insecure: bool,
+
     #[clap(long = "mqtt-client-id", env = "DAIKIN_MQTT_CLIENT_ID", default_value_t = String::from("daikin2mqtt"))]
     mqtt_client_id: String,
 
@@ -91,7 +99,7 @@ fn main() -> secretspec::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async { bridge::DaikinMqttBridge::new(cfg).run().await })
+        .block_on(async { bridge::DaikinMqttBridge::new(cfg)?.run().await })
         .expect("Failed to run bridge");
     Ok(())
 }
@@ -114,6 +122,8 @@ fn bridge_config(opt: Opt, mut secrets: HashMap<String, SecretBytes>) -> secrets
         mqtt_config: MqttConfig {
             server: opt.mqtt_addr,
             port: opt.mqtt_port,
+            ca_cert: opt.mqtt_ca_cert,
+            insecure: opt.mqtt_insecure,
             client_id: opt.mqtt_client_id,
             user: take_secret("MQTT_USERNAME")?,
             password: take_secret("MQTT_PASSWORD")?,
@@ -145,6 +155,9 @@ mod tests {
         let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost"]).expect("valid options without CLI secrets");
 
         assert_eq!(opt.mqtt_client_id, "daikin2mqtt");
+        assert_eq!(opt.mqtt_port, 1883);
+        assert!(opt.mqtt_ca_cert.is_none());
+        assert!(!opt.mqtt_insecure);
         assert_eq!(opt.cloud_redirect_uri, "http://localhost:8076/oauth/callback");
         assert_eq!(opt.web_listen, SocketAddr::from(([0, 0, 0, 0], 8076)));
         assert!(!opt.hass_discovery);
@@ -155,6 +168,32 @@ mod tests {
         let opt = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--hass-discovery"]).expect("valid Home Assistant discovery flag");
 
         assert!(opt.hass_discovery);
+    }
+
+    #[test_log::test]
+    fn mqtt_tls_options_are_mutually_exclusive() {
+        let err = parse_args(&["daikin2mqtt", "--mqtt-addr", "localhost", "--mqtt-ca-cert", "ca.pem", "--mqtt-insecure"])
+            .err()
+            .expect("conflicting TLS options must fail");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test_log::test]
+    fn wires_mqtt_tls_options_into_bridge_config() {
+        for (options, ca_cert, insecure) in [
+            (vec!["--mqtt-ca-cert", "ca.pem"], Some(PathBuf::from("ca.pem")), false),
+            (vec!["--mqtt-insecure"], None, true),
+        ] {
+            let mut args = vec!["daikin2mqtt", "--mqtt-addr", "localhost", "--mqtt-port", "8883"];
+            args.extend(options);
+            let opt = parse_args(&args).expect("valid MQTT TLS options");
+            let secrets = resolve_secrets("DAIKIN_CLIENT_ID=test-client\nDAIKIN_CLIENT_SECRET=test-secret\nMQTT_USERNAME=test-user\nMQTT_PASSWORD=test-pass\n")
+                .expect("all required secrets are available");
+            let cfg = bridge_config(opt, secrets).expect("valid bridge configuration");
+            assert_eq!(cfg.mqtt_config.ca_cert, ca_cert);
+            assert_eq!(cfg.mqtt_config.insecure, insecure);
+            assert_eq!(cfg.mqtt_config.port, 8883);
+        }
     }
 
     #[test_log::test]
@@ -252,7 +291,12 @@ mod tests {
     #[test_log::test]
     fn configures_non_secret_environment_without_client_id_collision() {
         let command = Opt::command();
-        for (id, env) in [("mqtt_client_id", "DAIKIN_MQTT_CLIENT_ID"), ("cloud_redirect_uri", "DAIKIN_REDIRECT_URI")] {
+        for (id, env) in [
+            ("mqtt_client_id", "DAIKIN_MQTT_CLIENT_ID"),
+            ("cloud_redirect_uri", "DAIKIN_REDIRECT_URI"),
+            ("mqtt_ca_cert", "DAIKIN_MQTT_CA_CERT"),
+            ("mqtt_insecure", "DAIKIN_MQTT_INSECURE"),
+        ] {
             let arg = command.get_arguments().find(|arg| arg.get_id() == id).expect("non-secret argument exists");
             assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
         }

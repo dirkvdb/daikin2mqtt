@@ -1,5 +1,7 @@
 # MQTT status topics
 
+See [MQTT TLS](mqtt-tls.md) for encrypted broker connections.
+
 All topics below are relative to the configured MQTT base topic. Status messages
 are retained and published with QoS 1 after a successful cloud update.
 
