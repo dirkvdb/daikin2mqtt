@@ -25,3 +25,10 @@ daikin2mqtt --mqtt-addr mqtt.example.com --mqtt-port 8883 --mqtt-ca-cert /path/t
 
 When using a container, mount the certificate file read-only and set
 `DAIKIN_MQTT_CA_CERT` to its path inside the container.
+
+At startup, the bridge logs the configured broker, port, client ID, username,
+base topic, TLS mode (`disabled`, `verified`, or `insecure`), and CA certificate
+path. Passwords and certificate contents are not logged. `MQTT client created;
+broker connection pending` only confirms local client initialization. A successful
+MQTT handshake logs `MQTT connection established`; connection errors include the
+broker, port, and failure reason.

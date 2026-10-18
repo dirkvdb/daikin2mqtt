@@ -34,6 +34,20 @@ pub struct MqttConfig {
 }
 
 impl MqttConfig {
+    fn connection_details(&self) -> String {
+        let tls = if self.ca_cert.is_some() {
+            "verified"
+        } else if self.insecure {
+            "insecure"
+        } else {
+            "disabled"
+        };
+        format!(
+            "broker={:?}, port={}, client_id={:?}, username={:?}, base_topic={:?}, tls={tls}, ca_cert={:?}",
+            self.server, self.port, self.client_id, self.user, self.base_topic, self.ca_cert,
+        )
+    }
+
     fn transport(&self) -> Result<Transport, MqttBridgeError> {
         if self.ca_cert.is_some() && self.insecure {
             return Err(MqttBridgeError::RuntimeError(
@@ -120,6 +134,7 @@ fn state_topic(base_topic: &String) -> String {
 
 impl MqttConnection {
     pub fn new(cfg: MqttConfig) -> Result<MqttConnection, MqttBridgeError> {
+        log::info!("MQTT connection configuration: {}", cfg.connection_details());
         let transport = cfg.transport()?;
         let mut mqttoptions = MqttOptions::new(cfg.client_id, cfg.server, cfg.port);
         mqttoptions.set_transport(transport);
@@ -133,7 +148,7 @@ impl MqttConnection {
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 100);
 
-        log::info!("MQTT connection created");
+        log::info!("MQTT client created; broker connection pending");
         Ok(MqttConnection {
             client,
             eventloop,
@@ -145,7 +160,8 @@ impl MqttConnection {
         match self.eventloop.poll().await {
             Ok(msg) => self.handle_mqtt_message(msg).await,
             Err(err) => {
-                log::warn!("MQTT connection error: {err}");
+                let (broker, port) = self.eventloop.options.broker_address();
+                log::warn!("MQTT connection error: broker={broker:?}, port={port}, error={err}");
                 Err(err.into())
             }
         }
@@ -186,6 +202,11 @@ impl MqttConnection {
             Event::Incoming(event) => match event {
                 Packet::ConnAck(data) => {
                     if data.code == ConnectReturnCode::Success {
+                        let (broker, port) = self.eventloop.options.broker_address();
+                        log::info!(
+                            "MQTT connection established: broker={broker:?}, port={port}, session_present={}",
+                            data.session_present
+                        );
                         if !data.session_present {
                             log::info!("Subscribe to mqtt commands");
                             self.subscribe_to_commands().await?;
@@ -193,7 +214,8 @@ impl MqttConnection {
                             log::debug!("Session still active, no need to resubsribe");
                         }
                     } else {
-                        log::error!("MQTT connection refused: {:?}", data.code);
+                        let (broker, port) = self.eventloop.options.broker_address();
+                        log::error!("MQTT connection refused: broker={broker:?}, port={port}, reason={:?}", data.code);
                     }
                 }
                 Packet::Publish(publ) => {
@@ -248,6 +270,39 @@ mod tests {
             user: String::new(),
             password: String::new(),
             base_topic: "daikin".into(),
+        }
+    }
+
+    #[test]
+    fn connection_details_include_configuration_but_not_the_password() {
+        let mut cfg = MqttConfig {
+            server: "mqtt.lan".into(),
+            port: 8883,
+            client_id: "test-client".into(),
+            user: "iot".into(),
+            password: "must-not-appear-in-logs".into(),
+            base_topic: "house/daikin".into(),
+            ..config()
+        };
+        for (ca_cert, insecure, tls) in [
+            (None, false, "disabled"),
+            (None, true, "insecure"),
+            (Some(PathBuf::from("/run/secrets/mqtt-ca.crt")), false, "verified"),
+        ] {
+            cfg.ca_cert = ca_cert;
+            cfg.insecure = insecure;
+            let details = cfg.connection_details();
+            assert!(details.contains("broker=\"mqtt.lan\""));
+            assert!(details.contains("port=8883"));
+            assert!(details.contains("client_id=\"test-client\""));
+            assert!(details.contains("username=\"iot\""));
+            assert!(details.contains("base_topic=\"house/daikin\""));
+            assert!(details.contains(&format!("tls={tls}")));
+            if cfg.ca_cert.is_some() {
+                assert!(details.contains("/run/secrets/mqtt-ca.crt"));
+            }
+            assert!(!details.contains(&cfg.password));
+            assert!(!details.contains("password"));
         }
     }
 
