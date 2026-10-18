@@ -18,22 +18,29 @@ SecretSpec credentials and other bridge configuration are still required.
 
 ## Discovery and state topics
 
-The bridge publishes retained climate and water-heater discovery configurations to:
+The bridge publishes one retained device discovery configuration containing the
+climate, water-heater, and writable leaving-water offset controls:
 
 ```text
-homeassistant/climate/{climate_unique_id}/config
-homeassistant/water_heater/{water_heater_unique_id}/config
+homeassistant/device/{device_id}/config
 ```
 
-Unique IDs use `daikin_<hex encoding of the UTF-8 MQTT base topic>` followed by
-`_climate_control` or `_domestic_hot_water`. Both entities share the same Daikin
-heat-pump device in Home Assistant. For the default base topic `daikin`, the
-discovery topics are:
+The device ID is `daikin_<hex encoding of the UTF-8 MQTT base topic>`. Component
+unique IDs append `_climate_control`, `_domestic_hot_water`, or
+`_heating_setpoint_leaving_water_offset`. All components are grouped under one
+**Daikin heat pump** device in Home Assistant. For the default base topic
+`daikin`, the discovery topic is:
 
 ```text
-homeassistant/climate/daikin_6461696b696e_climate_control/config
-homeassistant/water_heater/daikin_6461696b696e_domestic_hot_water/config
+homeassistant/device/daikin_6461696b696e/config
 ```
+
+This requires a Home Assistant version that supports MQTT device discovery.
+Entity unique IDs, device identifiers, and state/command topics are preserved.
+
+The leaving-water offset number is included only when the cloud reports a
+writable control. If it becomes unavailable or read-only, the bridge explicitly
+removes the component, then retains a device configuration without it.
 
 The entities use these topics, where `<base>` is configured with
 `--mqtt-base-topic` or `DAIKIN_MQTT_BASE_TOPIC` (default: `daikin`):
@@ -42,13 +49,15 @@ The entities use these topics, where `<base>` is configured with
 | --- | --- |
 | Climate state | `<base>/climate_control` |
 | Water-heater state | `<base>/domestic_hot_water` |
-| Availability (both entities) | `<base>/state` |
+| Availability (all entities) | `<base>/state` |
 | Climate mode command | `<base>/cmnd/climate_mode` |
 | Climate power command | `<base>/cmnd/climate_power` |
 | Climate temperature command | `<base>/cmnd/climate_temperature` |
 | Water-heater mode command | `<base>/cmnd/domestic_hot_water_mode` |
 | Water-heater power command | `<base>/cmnd/domestic_hot_water_power` |
 | Water-heater temperature command | `<base>/cmnd/domestic_hot_water_temperature` |
+| Leaving-water offset state | `<base>/climate_control` (`heating_setpoint_leaving_water_offset`) |
+| Leaving-water offset command | `<base>/cmnd/heating_setpoint_leaving_water_offset` |
 
 The climate entity reports `off`, `heat`, or `auto`: the Daikin operation modes
 `heating` and `auto` map to `heat` and `auto`, while an off power state takes
@@ -67,9 +76,9 @@ and [MQTT climate specification](https://www.home-assistant.io/integrations/clim
 
 The water-heater specification has no additional command topic types. Climate
 fan, swing, humidity, and separate high/low temperature controls are not exposed
-because the supplied Daikin device data does not support them. Holiday dates,
-schedules, and leaving-water offsets are not mapped to these entities; they
-would need separately defined controls rather than invented climate presets.
+because the supplied Daikin device data does not support them. Holiday dates and
+schedules are not mapped to these entities. The leaving-water offset is exposed
+as a separate number control on the same device, rather than a climate preset.
 
 Both discovered entities support mode, power, and writable target-temperature
 commands. Home Assistant publishes commands at QoS 1 without retention. The
@@ -143,7 +152,7 @@ since brokers can deliver a live retained publication without marking it as
 retained to existing subscribers.
 
 Discovery configuration is published with retain enabled on every successful
-status update. Home Assistant can discover the entity after connecting, and a
+status update. Home Assistant can discover the device after connecting, and a
 broker restart that loses retained messages is repaired by the next successful
 status update.
 

@@ -78,6 +78,61 @@ fn device_id(base_topic: &str) -> String {
     format!("daikin_{topic_id}")
 }
 
+/// Group the controls under one device.
+pub fn create_discovery_messages(base_topic: &str, devices: &serde_json::Value) -> Result<Vec<MqttData>, MqttBridgeError> {
+    let id = device_id(base_topic);
+    let topic = format!("{HASS_DISCOVERY_TOPIC}/device/{id}/config");
+    let entities = [
+        (
+            "climate",
+            "climate_control",
+            with_device_capabilities(climate_control_topic(base_topic)?, base_topic, devices, false)?,
+        ),
+        (
+            "water_heater",
+            "domestic_hot_water",
+            with_device_capabilities(domestic_hot_water_topic(base_topic)?, base_topic, devices, true)?,
+        ),
+        (
+            "number",
+            "heating_setpoint_leaving_water_offset",
+            leaving_water_offset_topic(base_topic, devices)?,
+        ),
+    ];
+    let mut components = serde_json::Map::new();
+    let mut removed = serde_json::Map::new();
+    let mut messages = Vec::new();
+    for (platform, suffix, data) in entities {
+        let unique_id = format!("{id}_{suffix}");
+        if data.payload.is_empty() {
+            removed.insert(unique_id, serde_json::json!({"p": platform}));
+        } else {
+            let mut component: serde_json::Value = serde_json::from_str(&data.payload)?;
+            let fields = component.as_object_mut().ok_or(MqttBridgeError::ParseError)?;
+            for field in ["device", "origin", "availability_topic"] {
+                fields.remove(field);
+            }
+            fields.insert("p".into(), platform.into());
+            components.insert(unique_id, component);
+        }
+    }
+    let payload = serde_json::json!({
+        "device": Device::heat_pump(id),
+        "origin": Origin::daikin2mqtt(),
+        "availability_topic": format!("{base_topic}/state"),
+        "cmps": components,
+    });
+    if !removed.is_empty() {
+        // HA requires an explicit platform-only config to remove a component.
+        // Follow it with the current config so the retained payload is clean.
+        let mut removal_payload = payload.clone();
+        removal_payload["cmps"].as_object_mut().expect("components object").extend(removed);
+        messages.push(MqttData::new(topic.clone(), serde_json::to_string(&removal_payload)?));
+    }
+    messages.push(MqttData::new(topic, serde_json::to_string(&payload)?));
+    Ok(messages)
+}
+
 pub fn climate_control_topic(base_topic: &str) -> Result<MqttData, MqttBridgeError> {
     let device_id = device_id(base_topic);
     let unique_id = format!("{device_id}_climate_control");
@@ -229,6 +284,69 @@ pub(crate) fn with_device_capabilities(data: MqttData, base_topic: &str, devices
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn device_discovery_groups_controls_and_preserves_entity_configuration() {
+        let devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
+        for base in ["daikin", "home/daikin", "home/暖房"] {
+            let messages = create_discovery_messages(base, &devices).expect("device discovery");
+            assert_eq!(messages.len(), 1);
+            let id = device_id(base);
+            assert_eq!(messages[0].topic, format!("homeassistant/device/{id}/config"));
+            assert!(messages[0].topic.is_ascii());
+            let payload: Value = serde_json::from_str(&messages[0].payload).expect("device JSON");
+            assert_eq!(payload["device"]["identifiers"], json!([id]));
+            assert_eq!(payload["device"]["name"], "Daikin heat pump");
+            assert_eq!(payload["device"]["manufacturer"], "Daikin");
+            assert_eq!(payload["origin"]["name"], env!("CARGO_PKG_NAME"));
+            assert_eq!(payload["availability_topic"], format!("{base}/state"));
+            let components = payload["cmps"].as_object().expect("components");
+            assert_eq!(components.len(), 3);
+            for (platform, legacy) in [
+                (
+                    "climate",
+                    with_device_capabilities(climate_control_topic(base).expect("climate"), base, &devices, false).expect("capabilities"),
+                ),
+                (
+                    "water_heater",
+                    with_device_capabilities(domestic_hot_water_topic(base).expect("water heater"), base, &devices, true).expect("capabilities"),
+                ),
+                ("number", leaving_water_offset_topic(base, &devices).expect("offset")),
+            ] {
+                let mut expected: Value = serde_json::from_str(&legacy.payload).expect("entity JSON");
+                let unique_id = expected["unique_id"].as_str().expect("unique ID").to_owned();
+                let component = &components[&unique_id];
+                assert_eq!(component["p"], platform);
+                for field in ["device", "origin", "availability_topic"] {
+                    assert!(component.get(field).is_none());
+                    expected.as_object_mut().expect("entity object").remove(field);
+                }
+                expected["p"] = platform.into();
+                assert_eq!(component, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn device_discovery_explicitly_removes_unavailable_offset_and_retains_clean_config() {
+        let mut devices: Value = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
+        point(&mut devices, false)["temperatureControl"]["settable"] = json!(false);
+        let offset_id = "daikin_6461696b696e_heating_setpoint_leaving_water_offset";
+        for snapshot in [devices, json!([])] {
+            let messages = create_discovery_messages("daikin", &snapshot).expect("device update");
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].topic, messages[1].topic);
+            let removal: Value = serde_json::from_str(&messages[0].payload).expect("removal JSON");
+            let retained: Value = serde_json::from_str(&messages[1].payload).expect("retained JSON");
+            assert_eq!(removal["cmps"][offset_id], json!({"p": "number"}));
+            assert_eq!(retained["cmps"].as_object().expect("components").len(), 2);
+            assert!(retained["cmps"].get(offset_id).is_none());
+            for (id, component) in retained["cmps"].as_object().expect("components") {
+                assert_eq!(removal["cmps"][id], *component);
+                assert!(component.get("temperature_command_topic").is_none());
+            }
+        }
+    }
 
     #[test]
     fn leaving_water_offset_discovery_exposes_writable_integer_control() {

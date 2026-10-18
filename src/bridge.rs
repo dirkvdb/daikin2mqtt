@@ -320,22 +320,9 @@ impl DaikinMqttBridge {
     async fn update_heatpump_status(&mut self, status: DaikinStatus) -> Result<(), MqttBridgeError> {
         if self.hass_discovery {
             // Republish with status so discovery also recovers after a broker restart.
-            let climate = hassdiscovery::with_device_capabilities(
-                hassdiscovery::climate_control_topic(self.mqtt.base_topic())?,
-                self.mqtt.base_topic(),
-                &self.devices,
-                false,
-            )?;
-            let water_heater = hassdiscovery::with_device_capabilities(
-                hassdiscovery::domestic_hot_water_topic(self.mqtt.base_topic())?,
-                self.mqtt.base_topic(),
-                &self.devices,
-                true,
-            )?;
-            self.mqtt.publish(climate, true).await?;
-            self.mqtt.publish(water_heater, true).await?;
-            let offset = hassdiscovery::leaving_water_offset_topic(self.mqtt.base_topic(), &self.devices)?;
-            self.mqtt.publish(offset, true).await?;
+            for message in hassdiscovery::create_discovery_messages(self.mqtt.base_topic(), &self.devices)? {
+                self.mqtt.publish(message, true).await?;
+            }
         }
 
         for message in status.mqtt_messages(self.mqtt.base_topic())? {
@@ -489,37 +476,23 @@ mod tests {
             })
             .expect("create test bridge");
             bridge.devices = serde_json::from_str(include_str!("../resources/test/managementpoints.json")).expect("device fixture");
-            let discovery = [
-                hassdiscovery::with_device_capabilities(
-                    hassdiscovery::climate_control_topic("test/daikin").expect("climate discovery data"),
-                    "test/daikin",
-                    &bridge.devices,
-                    false,
-                )
-                .expect("climate capabilities"),
-                hassdiscovery::with_device_capabilities(
-                    hassdiscovery::domestic_hot_water_topic("test/daikin").expect("water heater discovery data"),
-                    "test/daikin",
-                    &bridge.devices,
-                    true,
-                )
-                .expect("water heater capabilities"),
-                hassdiscovery::leaving_water_offset_topic("test/daikin", &bridge.devices).expect("offset discovery data"),
-            ];
             let fixture = include_str!("../resources/test/managementpoints.json");
             let status_messages = DaikinMqttBridge::process_status_json(fixture.to_owned())
                 .expect("process status fixture")
                 .mqtt_messages("test/daikin")
                 .expect("status messages");
             assert_eq!(status_messages.len(), 6);
-            let mut expected_topics = Vec::new();
-            for _ in 0..2 {
+            let mut expected_messages = Vec::new();
+            for poll in 0..3 {
+                if poll == 2 {
+                    bridge.devices = Value::Null;
+                }
                 let status = DaikinMqttBridge::process_status_json(fixture.to_owned()).expect("process status fixture");
                 bridge.update_heatpump_status(status).await.expect("queue status update");
                 if enabled {
-                    expected_topics.extend(discovery.iter().map(|data| data.topic.clone()));
+                    expected_messages.extend(hassdiscovery::create_discovery_messages("test/daikin", &bridge.devices).expect("discovery messages"));
                 }
-                expected_topics.extend(status_messages.iter().map(|data| data.topic.clone()));
+                expected_messages.extend(status_messages.iter().map(|data| MqttData::new(data.topic.clone(), data.payload.clone())));
             }
 
             let broker = async {
@@ -528,15 +501,13 @@ mod tests {
                 assert!(matches!(read_packet(&mut stream, &mut buffer).await, Packet::Connect(..)));
                 // MQTT 5 CONNACK: successful connection, no existing session or properties.
                 stream.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]).await.expect("send CONNACK");
-                for topic in expected_topics {
+                for data in expected_messages {
                     loop {
                         if let Packet::Publish(publish) = read_packet(&mut stream, &mut buffer).await {
-                            assert_eq!(publish.topic.as_ref(), topic.as_bytes());
+                            assert_eq!(publish.topic.as_ref(), data.topic.as_bytes());
                             assert!(publish.retain);
                             assert_eq!(publish.qos, QoS::AtLeastOnce);
-                            if let Some(data) = discovery.iter().chain(status_messages.iter()).find(|data| data.topic == topic) {
-                                assert_eq!(publish.payload.as_ref(), data.payload.as_bytes());
-                            }
+                            assert_eq!(publish.payload.as_ref(), data.payload.as_bytes());
                             break;
                         }
                     }
