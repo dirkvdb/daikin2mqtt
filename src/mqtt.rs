@@ -124,6 +124,7 @@ pub struct MqttConnection {
     eventloop: EventLoop,
     base_topic: String,
     connected: Arc<AtomicBool>,
+    availability_payload: &'static str,
 }
 
 impl Drop for MqttConnection {
@@ -168,6 +169,7 @@ impl MqttConnection {
             eventloop,
             base_topic: cfg.base_topic,
             connected: Arc::new(AtomicBool::new(false)),
+            availability_payload: OFFLINE_PAYLOAD,
         })
     }
 
@@ -202,18 +204,16 @@ impl MqttConnection {
     }
 
     pub async fn publish_online(&mut self) -> Result<(), MqttBridgeError> {
-        self.client
-            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, ONLINE_PAYLOAD)
-            .await?;
-
-        Ok(())
+        self.publish_availability(ONLINE_PAYLOAD).await
     }
 
     pub async fn publish_offline(&mut self) -> Result<(), MqttBridgeError> {
-        self.client
-            .publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, OFFLINE_PAYLOAD)
-            .await?;
+        self.publish_availability(OFFLINE_PAYLOAD).await
+    }
 
+    async fn publish_availability(&mut self, payload: &'static str) -> Result<(), MqttBridgeError> {
+        self.client.publish(state_topic(&self.base_topic), QoS::AtLeastOnce, true, payload).await?;
+        self.availability_payload = payload;
         Ok(())
     }
 
@@ -228,6 +228,9 @@ impl MqttConnection {
                             "MQTT connection established: broker={broker:?}, port={port}, session_present={}",
                             data.session_present
                         );
+                        // The broker may retain our offline will after a disconnect.
+                        // Restore cloud availability, not just MQTT connectivity.
+                        self.publish_availability(self.availability_payload).await?;
                         if !data.session_present {
                             log::info!("Subscribe to mqtt commands");
                             self.subscribe_to_commands().await?;
@@ -320,6 +323,101 @@ mod tests {
                 .await
                 .expect("handle CONNACK");
             assert_eq!(status.load(Ordering::Relaxed), connected);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_republishes_retained_cloud_availability() {
+        use rumqttc::v5::mqttbytes::Error as MqttError;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_packet(stream: &mut tokio::net::TcpStream, buffer: &mut BytesMut) -> Packet {
+            loop {
+                match Packet::read(buffer, None) {
+                    Ok(packet) => return packet,
+                    Err(MqttError::InsufficientBytes(_)) => assert!(stream.read_buf(buffer).await.expect("read MQTT packet") > 0),
+                    Err(err) => panic!("invalid MQTT packet: {err}"),
+                }
+            }
+        }
+
+        for session_present in [0, 1] {
+            for online in [None, Some(true), Some(false)] {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind test broker");
+                let mut mqtt = MqttConnection::new(MqttConfig {
+                    server: "127.0.0.1".into(),
+                    port: listener.local_addr().expect("broker address").port(),
+                    ..config()
+                })
+                .expect("create MQTT connection");
+                let mut expected = Vec::new();
+                if let Some(online) = online {
+                    mqtt.publish_online().await.expect("queue cloud online status");
+                    expected.push(ONLINE_PAYLOAD);
+                    if !online {
+                        mqtt.publish_offline().await.expect("queue cloud offline status");
+                        expected.push(OFFLINE_PAYLOAD);
+                    }
+                }
+                let payload = if online == Some(true) { ONLINE_PAYLOAD } else { OFFLINE_PAYLOAD };
+                expected.push(payload);
+                let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
+                let broker = async {
+                    let (mut stream, _) = listener.accept().await.expect("accept initial MQTT connection");
+                    let mut buffer = BytesMut::new();
+                    assert!(matches!(read_packet(&mut stream, &mut buffer).await, Packet::Connect(..)));
+                    stream.write_all(&[0x20, 0x03, 0, 0, 0]).await.expect("send initial CONNACK");
+                    for expected_payload in expected {
+                        loop {
+                            if let Packet::Publish(publish) = read_packet(&mut stream, &mut buffer).await {
+                                assert_eq!(publish.topic.as_ref(), b"daikin/state");
+                                assert_eq!(publish.payload.as_ref(), expected_payload.as_bytes());
+                                assert!(publish.retain);
+                                assert_eq!(publish.qos, QoS::AtLeastOnce);
+                                let id = publish.pkid.to_be_bytes();
+                                stream.write_all(&[0x40, 0x02, id[0], id[1]]).await.expect("send PUBACK");
+                                break;
+                            }
+                        }
+                    }
+                    // Confirm all PUBACKs were processed before disconnecting, so an
+                    // in-flight retransmission cannot masquerade as a fresh status.
+                    stream.write_all(&[0x30, 7, 0, 4, b's', b'y', b'n', b'c', 0]).await.expect("send sync marker");
+                    synced_rx.await.expect("client processed initial PUBACKs");
+                    drop(stream);
+
+                    let (mut stream, _) = listener.accept().await.expect("accept reconnected MQTT client");
+                    let mut buffer = BytesMut::new();
+                    assert!(matches!(read_packet(&mut stream, &mut buffer).await, Packet::Connect(..)));
+                    stream.write_all(&[0x20, 0x03, session_present, 0, 0]).await.expect("send reconnect CONNACK");
+                    loop {
+                        if let Packet::Publish(publish) = read_packet(&mut stream, &mut buffer).await {
+                            assert_eq!(publish.topic.as_ref(), b"daikin/state");
+                            assert_eq!(publish.payload.as_ref(), payload.as_bytes());
+                            assert!(publish.retain);
+                            assert_eq!(publish.qos, QoS::AtLeastOnce);
+                            break;
+                        }
+                    }
+                };
+                let drive_mqtt = async {
+                    let mut synced_tx = Some(synced_tx);
+                    loop {
+                        if let Ok(Some(message)) = mqtt.poll().await {
+                            assert_eq!(message.topic, "sync");
+                            synced_tx.take().expect("single sync marker").send(()).expect("notify test broker");
+                        }
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = broker => {}
+                        _ = drive_mqtt => panic!("MQTT event loop unexpectedly stopped"),
+                    }
+                })
+                .await
+                .expect("availability is republished promptly after reconnect");
+            }
         }
     }
 
